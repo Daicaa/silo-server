@@ -34,6 +34,13 @@ var nvencProbeCache = struct {
 	byPath: make(map[string]nvencProbeResult),
 }
 
+var videoToolboxProbeCache = struct {
+	sync.Mutex
+	byPath map[string]nvencProbeResult
+}{
+	byPath: make(map[string]nvencProbeResult),
+}
+
 // HWAccelInfo describes the detected hardware acceleration capability.
 type HWAccelInfo struct {
 	Resolved            string             `json:"resolved"`
@@ -98,6 +105,16 @@ func ResolveHWAccel(hwAccel string) string {
 func ResolveHWAccelWithFFmpeg(hwAccel string, ffmpegPath string) string {
 	if hwAccel != "auto" {
 		return hwAccel
+	}
+	if currentGOOS == "darwin" {
+		if ok, reason := ffmpegSupportsVideoToolbox(ffmpegPath); ok {
+			slog.Info("hw_accel=auto: macOS detected, using VideoToolbox")
+			return "videotoolbox"
+		} else {
+			slog.Warn("hw_accel=auto: macOS detected but FFmpeg VideoToolbox probe failed",
+				"ffmpeg", normalizeFFmpegPath(ffmpegPath), "reason", reason)
+		}
+		return "none"
 	}
 	if currentGOOS != "linux" {
 		return "none"
@@ -166,6 +183,58 @@ func ffmpegSupportsNVENC(ffmpegPath string) (bool, string) {
 	nvencProbeCache.byPath[ffmpegPath] = result
 	nvencProbeCache.Unlock()
 	return result.available, result.reason
+}
+
+func ffmpegSupportsVideoToolbox(ffmpegPath string) (bool, string) {
+	ffmpegPath = normalizeFFmpegPath(ffmpegPath)
+	videoToolboxProbeCache.Lock()
+	if result, ok := videoToolboxProbeCache.byPath[ffmpegPath]; ok {
+		videoToolboxProbeCache.Unlock()
+		return result.available, result.reason
+	}
+	videoToolboxProbeCache.Unlock()
+
+	result := probeFFmpegVideoToolbox(ffmpegPath)
+	videoToolboxProbeCache.Lock()
+	videoToolboxProbeCache.byPath[ffmpegPath] = result
+	videoToolboxProbeCache.Unlock()
+	return result.available, result.reason
+}
+
+// probeFFmpegVideoToolbox verifies the configured FFmpeg exposes VideoToolbox
+// decode plus both encoders, then smoke-encodes one frame. No filter probes:
+// the videotoolbox pipeline keeps decoded frames in system memory, so the
+// regular software filter graph applies (see appendHWAccelArgs).
+func probeFFmpegVideoToolbox(ffmpegPath string) nvencProbeResult {
+	if output, err := runFFmpegProbe(ffmpegPath, "-hide_banner", "-hwaccels"); err != nil {
+		return nvencProbeResult{reason: "hwaccels probe failed: " + probeFailure(err, output)}
+	} else if !ffmpegOutputHasToken(output, "videotoolbox") {
+		return nvencProbeResult{reason: "videotoolbox hwaccel unavailable"}
+	}
+
+	if output, err := runFFmpegProbe(ffmpegPath, "-hide_banner", "-encoders"); err != nil {
+		return nvencProbeResult{reason: "encoders probe failed: " + probeFailure(err, output)}
+	} else if !ffmpegOutputHasToken(output, "h264_videotoolbox") {
+		return nvencProbeResult{reason: "h264_videotoolbox encoder unavailable"}
+	} else if !ffmpegOutputHasToken(output, "hevc_videotoolbox") {
+		return nvencProbeResult{reason: "hevc_videotoolbox encoder unavailable"}
+	}
+
+	if output, err := runFFmpegProbe(ffmpegPath,
+		"-hide_banner",
+		"-loglevel", "error",
+		"-f", "lavfi",
+		"-i", "testsrc2=size=640x360:rate=1",
+		"-frames:v", "1",
+		"-an",
+		"-c:v", "h264_videotoolbox",
+		"-f", "null",
+		"-",
+	); err != nil {
+		return nvencProbeResult{reason: "h264_videotoolbox smoke encode failed: " + probeFailure(err, output)}
+	}
+
+	return nvencProbeResult{available: true}
 }
 
 func normalizeFFmpegPath(ffmpegPath string) string {
