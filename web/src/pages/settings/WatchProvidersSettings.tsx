@@ -33,9 +33,13 @@ import {
 } from "@/hooks/queries/watchProviders";
 import { Input } from "@/components/ui/input";
 import { SchemaForm } from "@/components/admin/plugins/SchemaForm";
-import { buildSchemaValues, parseFieldTypes } from "@/components/admin/plugins/schemaFormUtils";
 import type { PluginConfigSchema } from "@/api/types";
 import type { WatchProviderConnectionConfig } from "@/hooks/queries/watchProviders";
+import {
+  buildConnectionConfig,
+  connectionSchemasAreValid,
+  type RenderableConnectionSchema,
+} from "./watchProviderConnectionConfig";
 
 function formatRelativeTime(value?: string) {
   if (!value) return "Never";
@@ -236,27 +240,13 @@ function APIKeyBlock({
   const [configValidity, setConfigValidity] = useState<Record<string, boolean>>({});
   const trimmed = value.trim();
   const renderableSchemas = configSchemas.filter(
-    (
-      schema,
-    ): schema is PluginConfigSchema & {
-      admin_form: NonNullable<PluginConfigSchema["admin_form"]>;
-    } => schema.admin_form != null,
+    (schema): schema is RenderableConnectionSchema => schema.admin_form != null,
   );
-  const configValid = renderableSchemas.every(
-    (schema) => configValidity[schema.key] ?? !schema.required,
+  const configValid = connectionSchemasAreValid(
+    renderableSchemas,
+    connectionConfig,
+    configValidity,
   );
-
-  const configuredValues = () =>
-    Object.fromEntries(
-      renderableSchemas.map((schema) => [
-        schema.key,
-        buildSchemaValues(
-          schema.admin_form,
-          connectionConfig[schema.key] ?? {},
-          parseFieldTypes(schema.json_schema),
-        ),
-      ]),
-    );
 
   return (
     <div className="border-primary/30 bg-primary/5 rounded-xl border border-dashed p-4">
@@ -314,7 +304,9 @@ function APIKeyBlock({
           type="button"
           size="sm"
           disabled={pending || trimmed.length === 0 || !configValid}
-          onClick={() => onSubmit(trimmed, configuredValues())}
+          onClick={() =>
+            onSubmit(trimmed, buildConnectionConfig(renderableSchemas, connectionConfig))
+          }
           className="sm:flex-none"
         >
           {pending ? <Loader2 className="h-4 w-4 animate-spin" /> : <Check className="h-4 w-4" />}

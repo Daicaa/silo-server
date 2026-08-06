@@ -86,6 +86,9 @@ func NewPluginProvider(options PluginProviderOptions) (*PluginProvider, error) {
 	if err != nil {
 		return nil, fmt.Errorf("watch sync plugin %q %w", options.ProviderKey, err)
 	}
+	if err := validateWatchSyncConnectionConfigSchemas(options.ConnectionConfigSchema); err != nil {
+		return nil, fmt.Errorf("watch sync plugin %q %w", options.ProviderKey, err)
+	}
 	if options.ResolveClient == nil {
 		return nil, fmt.Errorf("watch sync plugin client resolver is required")
 	}
@@ -172,7 +175,7 @@ func (p *PluginProvider) ConnectWithAPIKeyConfig(
 	if err != nil {
 		return TokenSet{}, ProviderAccount{}, err
 	}
-	connectionValues, err := p.connectionConfig(connectionConfig)
+	connectionValues, connectionSecrets, err := p.connectionConfig(connectionConfig)
 	if err != nil {
 		return TokenSet{}, ProviderAccount{}, err
 	}
@@ -189,7 +192,8 @@ func (p *PluginProvider) ConnectWithAPIKeyConfig(
 	if err != nil {
 		return TokenSet{}, ProviderAccount{}, watchSyncRPCError()
 	}
-	if err := watchSyncFaultError(p.Key(), response.GetFault(), apiKey); err != nil {
+	faultSecrets := append([]string{apiKey}, connectionSecrets...)
+	if err := watchSyncFaultError(p.Key(), response.GetFault(), faultSecrets...); err != nil {
 		return TokenSet{}, ProviderAccount{}, err
 	}
 	tokens, err := tokenSetFromProto(response.GetCredentials())
@@ -556,7 +560,7 @@ func (p *PluginProvider) providerConfig(ctx context.Context) (*pluginv1.WatchSyn
 	return config, nil
 }
 
-func (p *PluginProvider) connectionConfig(values ConnectionConfigValues) (*pluginv1.WatchSyncProviderConfig, error) {
+func (p *PluginProvider) connectionConfig(values ConnectionConfigValues) (*pluginv1.WatchSyncProviderConfig, []string, error) {
 	declared := make(map[string]*pluginv1.ConfigSchema, len(p.connectionConfigSchema))
 	for _, schema := range p.connectionConfigSchema {
 		if schema != nil && strings.TrimSpace(schema.GetKey()) != "" {
@@ -565,7 +569,7 @@ func (p *PluginProvider) connectionConfig(values ConnectionConfigValues) (*plugi
 	}
 	for key := range values {
 		if _, ok := declared[key]; !ok {
-			return nil, fmt.Errorf("watch sync connection config key %q is not declared", key)
+			return nil, nil, fmt.Errorf("watch sync connection config key %q is not declared", key)
 		}
 	}
 
@@ -573,6 +577,7 @@ func (p *PluginProvider) connectionConfig(values ConnectionConfigValues) (*plugi
 		Values:       make(map[string]string),
 		SecretValues: make(map[string]string),
 	}
+	var secrets []string
 	for _, schema := range p.connectionConfigSchema {
 		if schema == nil || strings.TrimSpace(schema.GetKey()) == "" {
 			continue
@@ -580,20 +585,17 @@ func (p *PluginProvider) connectionConfig(values ConnectionConfigValues) (*plugi
 		value, exists := values[schema.GetKey()]
 		if !exists {
 			if schema.GetRequired() {
-				return nil, fmt.Errorf("watch sync connection config %q is required", schema.GetKey())
+				return nil, nil, fmt.Errorf("watch sync connection config %q is required", schema.GetKey())
 			}
 			continue
 		}
 		if err := publicconfig.ValidateValue(schema, "watch sync connection config", schema.GetKey(), value); err != nil {
-			return nil, err
+			return nil, nil, err
 		}
-		publicFields := make(map[string]struct{})
-		if form := schema.GetAdminForm(); form != nil {
-			for _, field := range form.GetFields() {
-				if field != nil && !field.GetSecret() && field.GetControl() != pluginv1.AdminFormControl_ADMIN_FORM_CONTROL_PASSWORD {
-					publicFields[field.GetKey()] = struct{}{}
-				}
-			}
+		publicFieldNames, _ := hostplugins.ConfigSchemaFieldSets(schema)
+		publicFields := make(map[string]struct{}, len(publicFieldNames))
+		for _, field := range publicFieldNames {
+			publicFields[field] = struct{}{}
 		}
 		for field, raw := range value {
 			field = strings.TrimSpace(field)
@@ -602,17 +604,61 @@ func (p *PluginProvider) connectionConfig(values ConnectionConfigValues) (*plugi
 			}
 			encoded, err := connectionConfigString(raw)
 			if err != nil {
-				return nil, fmt.Errorf("encode watch sync connection config %q.%s: %w", schema.GetKey(), field, err)
+				return nil, nil, fmt.Errorf("encode watch sync connection config %q.%s: %w", schema.GetKey(), field, err)
 			}
 			key := schema.GetKey() + "." + field
 			if _, public := publicFields[field]; public {
 				result.Values[key] = encoded
 			} else {
 				result.SecretValues[key] = encoded
+				secrets = append(secrets, encoded)
+				secrets = append(secrets, connectionConfigSecretStrings(raw)...)
 			}
 		}
 	}
-	return result, nil
+	return result, secrets, nil
+}
+
+func connectionConfigSecretStrings(value any) []string {
+	switch typed := value.(type) {
+	case map[string]any:
+		var values []string
+		for _, child := range typed {
+			values = append(values, connectionConfigSecretStrings(child)...)
+		}
+		return values
+	case []any:
+		var values []string
+		for _, child := range typed {
+			values = append(values, connectionConfigSecretStrings(child)...)
+		}
+		return values
+	default:
+		encoded, err := connectionConfigString(typed)
+		if err != nil || strings.TrimSpace(encoded) == "" {
+			return nil
+		}
+		return []string{encoded}
+	}
+}
+
+func validateWatchSyncConnectionConfigSchemas(schemas []*pluginv1.ConfigSchema) error {
+	for _, schema := range schemas {
+		if schema == nil || schema.GetAdminForm() == nil {
+			continue
+		}
+		for _, field := range schema.GetAdminForm().GetFields() {
+			if field == nil || !field.GetDynamicOptions() || len(field.GetOptions()) > 0 {
+				continue
+			}
+			return fmt.Errorf(
+				"connection config %q field %q requires dynamic options, which watch provider setup does not support",
+				schema.GetKey(),
+				field.GetKey(),
+			)
+		}
+	}
+	return nil
 }
 
 func connectionConfigString(value any) (string, error) {

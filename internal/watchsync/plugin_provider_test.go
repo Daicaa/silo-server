@@ -261,6 +261,93 @@ func TestPluginProviderValidatesAndOverlaysConnectionConfig(t *testing.T) {
 	}
 }
 
+func TestPluginProviderClassifiesAndRedactsConnectionSecrets(t *testing.T) {
+	const nestedSecret = "nested-connection-secret"
+	client := &fakeWatchSyncPluginClient{exchangeResponse: &pluginv1.WatchSyncCredentialResponse{
+		Fault: &pluginv1.WatchSyncFault{
+			Code: pluginv1.WatchSyncFaultCode_WATCH_SYNC_FAULT_CODE_INVALID_CREDENTIAL,
+			SafeMessage: "credentials " + testSecretValue + " and " + nestedSecret +
+				" were rejected",
+		},
+	}}
+	schema := &pluginv1.ConfigSchema{
+		Key: "account",
+		JsonSchema: `{
+			"type":"object",
+			"properties":{
+				"base_url":{"type":"string","format":"uri"},
+				"client_secret":{"type":"string","format":"password"},
+				"advanced":{"type":"object","properties":{"password":{"type":"string","format":"password"}}}
+			},
+			"required":["base_url","client_secret","advanced"],
+			"additionalProperties":false
+		}`,
+		AdminForm: &pluginv1.AdminFormDescriptor{Fields: []*pluginv1.AdminFormField{
+			{Key: "base_url", Control: pluginv1.AdminFormControl_ADMIN_FORM_CONTROL_TEXT},
+			// JSON Schema remains authoritative even when a form incorrectly
+			// presents a credential as ordinary text.
+			{Key: "client_secret", Control: pluginv1.AdminFormControl_ADMIN_FORM_CONTROL_TEXT},
+			{Key: "advanced", Control: pluginv1.AdminFormControl_ADMIN_FORM_CONTROL_TEXT},
+		}},
+	}
+	provider, err := NewPluginProvider(PluginProviderOptions{
+		InstallationID: 4, ProviderKey: testPluginProviderKey, CapabilityID: testPluginCapabilityID,
+		Descriptor: &pluginv1.WatchSyncProviderDescriptor{AuthMethods: []pluginv1.WatchSyncAuthMethod{
+			pluginv1.WatchSyncAuthMethod_WATCH_SYNC_AUTH_METHOD_API_KEY,
+		}},
+		ConnectionConfigSchema: []*pluginv1.ConfigSchema{schema},
+		ResolveClient:          func(context.Context, int, string) (WatchSyncPluginClient, error) { return client, nil },
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, _, err = provider.ConnectWithAPIKeyConfig(context.Background(), "input-token", ConnectionConfigValues{
+		"account": {
+			"base_url":      "https://floppy.example.com",
+			"client_secret": testSecretValue,
+			"advanced":      map[string]any{"password": nestedSecret},
+		},
+	})
+	if !isWatchSyncInvalidCredentialError(err) {
+		t.Fatalf("error = %#v", err)
+	}
+	config := client.exchangeRequest.GetProviderConfig()
+	if config.GetValues()["account.base_url"] != "https://floppy.example.com" ||
+		config.GetSecretValues()["account.client_secret"] != testSecretValue ||
+		config.GetSecretValues()["account.advanced"] != `{"password":"nested-connection-secret"}` {
+		t.Fatalf("provider config = %#v", config)
+	}
+	if _, exposed := config.GetValues()["account.client_secret"]; exposed {
+		t.Fatal("JSON-schema password was exposed as a public provider value")
+	}
+	if strings.Contains(err.Error(), testSecretValue) || strings.Contains(err.Error(), nestedSecret) ||
+		!strings.Contains(err.Error(), "[REDACTED]") {
+		t.Fatalf("connection secrets were not redacted: %q", err)
+	}
+}
+
+func TestPluginProviderRejectsUnresolvableDynamicConnectionOptions(t *testing.T) {
+	_, err := NewPluginProvider(PluginProviderOptions{
+		InstallationID: 4, ProviderKey: testPluginProviderKey, CapabilityID: testPluginCapabilityID,
+		Descriptor: &pluginv1.WatchSyncProviderDescriptor{AuthMethods: []pluginv1.WatchSyncAuthMethod{
+			pluginv1.WatchSyncAuthMethod_WATCH_SYNC_AUTH_METHOD_API_KEY,
+		}},
+		ConnectionConfigSchema: []*pluginv1.ConfigSchema{{
+			Key: "server",
+			AdminForm: &pluginv1.AdminFormDescriptor{Fields: []*pluginv1.AdminFormField{{
+				Key: "library", Control: pluginv1.AdminFormControl_ADMIN_FORM_CONTROL_SELECT,
+				DynamicOptions: true,
+			}}},
+		}},
+		ResolveClient: func(context.Context, int, string) (WatchSyncPluginClient, error) {
+			return &fakeWatchSyncPluginClient{}, nil
+		},
+	})
+	if err == nil || !strings.Contains(err.Error(), "requires dynamic options") {
+		t.Fatalf("error = %v", err)
+	}
+}
+
 func TestPluginProviderRefreshReturnsCredentialsAlongsideFault(t *testing.T) {
 	client := &fakeWatchSyncPluginClient{refreshResponse: &pluginv1.WatchSyncCredentialResponse{
 		Credentials: &pluginv1.WatchSyncCredentials{AccessToken: testRotatedAccessToken, TokenType: testBearerTokenType},
