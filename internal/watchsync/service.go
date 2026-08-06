@@ -1534,7 +1534,14 @@ func (s *Service) exportLocalPlays(
 	if err := s.repo.UpsertHistoryExports(ctx, exports); err != nil {
 		return err
 	}
-	pending, err := s.repo.ListPendingHistoryExports(ctx, conn.ID, 100)
+	historyIDs := make([]string, 0, len(exports))
+	for _, export := range exports {
+		historyIDs = append(historyIDs, export.HistoryID)
+	}
+	// A live watch event must not wait behind a connection's historical
+	// backlog. Scheduled sync still drains that backlog oldest-first, while
+	// this path selects only the events the user just created.
+	pending, err := s.repo.ListPendingHistoryExportsByHistoryIDs(ctx, conn.ID, historyIDs)
 	if err != nil {
 		return err
 	}

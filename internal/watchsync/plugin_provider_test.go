@@ -1016,3 +1016,29 @@ func TestPluginProviderForwardsLiveScrobbleLifecycle(t *testing.T) {
 		t.Fatalf("scrobble event = %#v", got)
 	}
 }
+
+func TestPluginProviderForwardsAuthoritativeScrobbleCompletion(t *testing.T) {
+	completed := watchEventFromScrobble(ScrobbleEvent{
+		PlaybackSessionID: testPlaybackSessionID,
+		MediaItemID:       testMovieMediaID,
+		Kind:              historyimport.KindMovie,
+		PositionSeconds:   90,
+		DurationSeconds:   100,
+		Completed:         true,
+	}, pluginv1.WatchSyncOperation_WATCH_SYNC_OPERATION_SCROBBLE_STOP)
+	if !completed.GetCompleted() {
+		t.Fatal("completed event = false, want true")
+	}
+
+	incomplete := watchEventFromScrobble(ScrobbleEvent{
+		PlaybackSessionID: testPlaybackSessionID,
+		MediaItemID:       testMovieMediaID,
+		Kind:              historyimport.KindMovie,
+		PositionSeconds:   10,
+		DurationSeconds:   100,
+		Completed:         false,
+	}, pluginv1.WatchSyncOperation_WATCH_SYNC_OPERATION_SCROBBLE_STOP)
+	if incomplete.GetCompleted() {
+		t.Fatal("incomplete event = true, want false")
+	}
+}

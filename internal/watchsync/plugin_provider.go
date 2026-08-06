@@ -761,6 +761,7 @@ func watchEventFromScrobble(event ScrobbleEvent, operation pluginv1.WatchSyncOpe
 		PositionSeconds:   event.PositionSeconds,
 		DurationSeconds:   event.DurationSeconds,
 		CompletionPercent: completion,
+		Completed:         event.Completed,
 		ProviderItemKey:   event.ProviderItemKey,
 		Media: mediaFromIdentity(event.MediaItemID, event.Kind, "", 0,
 			event.IMDbID, event.TMDBID, event.TVDBID, "", 0,

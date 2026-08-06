@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"fmt"
 	"strconv"
 	"strings"
 	"sync"
@@ -341,6 +342,22 @@ func (r *serviceFakeRepo) ListPendingHistoryExports(_ context.Context, connectio
 			if limit > 0 && len(exports) >= limit {
 				break
 			}
+		}
+	}
+	return exports, nil
+}
+
+func (r *serviceFakeRepo) ListPendingHistoryExportsByHistoryIDs(_ context.Context, connectionID string, historyIDs []string) ([]HistoryExport, error) {
+	wanted := make(map[string]struct{}, len(historyIDs))
+	for _, historyID := range historyIDs {
+		wanted[historyID] = struct{}{}
+	}
+	var exports []HistoryExport
+	for _, export := range r.historyExports {
+		_, matches := wanted[export.HistoryID]
+		if export.ConnectionID == connectionID && matches &&
+			(export.Status == historyExportStatusPending || export.Status == historyExportStatusFailed) && export.AttemptCount < 5 {
+			exports = append(exports, export)
 		}
 	}
 	return exports, nil
@@ -789,6 +806,7 @@ func (p progressBatchImporterStub) FetchProgressBatch(context.Context, ServerCon
 type watchedExporterStub struct {
 	exportErr    error
 	exportResult ExportResult
+	exported     *[]LocalPlay
 	key          string
 	source       userstore.WatchHistorySource
 }
@@ -812,7 +830,10 @@ func (p watchedExporterStub) FetchHistory(context.Context, ServerConfig, Connect
 	return nil, nil
 }
 
-func (p watchedExporterStub) ExportHistory(context.Context, ServerConfig, Connection, []LocalPlay) (ExportResult, error) {
+func (p watchedExporterStub) ExportHistory(_ context.Context, _ ServerConfig, _ Connection, plays []LocalPlay) (ExportResult, error) {
+	if p.exported != nil {
+		*p.exported = append(*p.exported, plays...)
+	}
 	return p.exportResult, p.exportErr
 }
 
@@ -3127,6 +3148,40 @@ func TestServicePluginTransportFailureLeavesExportPending(t *testing.T) {
 	}
 	if len(repo.historyExports) != 1 || repo.historyExports[0].Status != historyExportStatusPending || repo.historyExports[0].AttemptCount != 0 {
 		t.Fatalf("history exports = %#v", repo.historyExports)
+	}
+}
+
+func TestServiceLocalWatchEventBypassesHistoricalExportBacklog(t *testing.T) {
+	repo := newServiceFakeRepo()
+	for i := 0; i < 100; i++ {
+		repo.historyExports = append(repo.historyExports, HistoryExport{
+			ID:           fmt.Sprintf("old-export-%d", i),
+			ConnectionID: "conn-1",
+			HistoryID:    fmt.Sprintf("old-history-%d", i),
+			Status:       historyExportStatusPending,
+			WatchedAt:    time.Date(2025, time.January, 1, 0, i, 0, 0, time.UTC),
+		})
+	}
+	var exported []LocalPlay
+	service := NewService(repo, NewRegistry())
+	play := LocalPlay{
+		HistoryID:       "new-history",
+		MediaItemID:     testMovieMediaID,
+		ProviderItemKey: testMovieProviderItemKey,
+		WatchedAt:       time.Date(2026, time.August, 6, 12, 0, 0, 0, time.UTC),
+	}
+	err := service.exportLocalPlays(context.Background(), Connection{ID: "conn-1"}, ServerConfig{}, watchedExporterStub{
+		exported:     &exported,
+		exportResult: ExportResult{Sent: []string{play.HistoryID}},
+	}, []LocalPlay{play})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(exported) != 1 || exported[0].HistoryID != play.HistoryID {
+		t.Fatalf("exported = %#v, want only the live event", exported)
+	}
+	if got := repo.historyExports[len(repo.historyExports)-1].Status; got != historyExportStatusSent {
+		t.Fatalf("new export status = %q, want %q", got, historyExportStatusSent)
 	}
 }
 
