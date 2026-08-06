@@ -46,6 +46,8 @@ type serviceFakeRepo struct {
 	settings               map[string]string
 	syncRuns               []SyncRun
 	historyExports         []HistoryExport
+	historyLookupIDs       []string
+	historyLookupLimit     int
 	listItemStates         []ListItemState
 	scrobbleConnections    []Connection
 	scrobbleSessions       []ScrobbleSession
@@ -347,7 +349,9 @@ func (r *serviceFakeRepo) ListPendingHistoryExports(_ context.Context, connectio
 	return exports, nil
 }
 
-func (r *serviceFakeRepo) ListPendingHistoryExportsByHistoryIDs(_ context.Context, connectionID string, historyIDs []string) ([]HistoryExport, error) {
+func (r *serviceFakeRepo) ListPendingHistoryExportsByHistoryIDs(_ context.Context, connectionID string, historyIDs []string, limit int) ([]HistoryExport, error) {
+	r.historyLookupIDs = append([]string(nil), historyIDs...)
+	r.historyLookupLimit = limit
 	wanted := make(map[string]struct{}, len(historyIDs))
 	for _, historyID := range historyIDs {
 		wanted[historyID] = struct{}{}
@@ -358,6 +362,9 @@ func (r *serviceFakeRepo) ListPendingHistoryExportsByHistoryIDs(_ context.Contex
 		if export.ConnectionID == connectionID && matches &&
 			(export.Status == historyExportStatusPending || export.Status == historyExportStatusFailed) && export.AttemptCount < 5 {
 			exports = append(exports, export)
+			if limit > 0 && len(exports) >= limit {
+				break
+			}
 		}
 	}
 	return exports, nil
@@ -809,6 +816,15 @@ type watchedExporterStub struct {
 	exported     *[]LocalPlay
 	key          string
 	source       userstore.WatchHistorySource
+}
+
+type singleBatchWatchedExporterStub struct {
+	watchedExporterStub
+	batchSize int
+}
+
+func (p singleBatchWatchedExporterStub) ExportBatchSize() int {
+	return p.batchSize
 }
 
 func (p watchedExporterStub) Key() string {
@@ -2608,6 +2624,12 @@ func TestServiceConfirmedStopSerializesConcurrentConfirmation(t *testing.T) {
 	}
 }
 
+func TestConfirmedStopLeaseExceedsDispatchTimeout(t *testing.T) {
+	if confirmedStopLease <= confirmedStopDispatchTimeout {
+		t.Fatalf("confirmed stop lease %s must exceed dispatch timeout %s", confirmedStopLease, confirmedStopDispatchTimeout)
+	}
+}
+
 func TestServiceConfirmedStopCannotCompleteReclaimedLease(t *testing.T) {
 	repo := newServiceFakeRepo()
 	repo.scrobbleConnections = []Connection{{
@@ -3182,6 +3204,40 @@ func TestServiceLocalWatchEventBypassesHistoricalExportBacklog(t *testing.T) {
 	}
 	if got := repo.historyExports[len(repo.historyExports)-1].Status; got != historyExportStatusSent {
 		t.Fatalf("new export status = %q, want %q", got, historyExportStatusSent)
+	}
+}
+
+func TestServiceLocalWatchEventBoundsHistoryLookupToProviderBatch(t *testing.T) {
+	repo := newServiceFakeRepo()
+	var exported []LocalPlay
+	plays := make([]LocalPlay, 0, 25)
+	for i := 0; i < 25; i++ {
+		plays = append(plays, LocalPlay{
+			HistoryID:       fmt.Sprintf("history-%d", i),
+			MediaItemID:     testMovieMediaID,
+			ProviderItemKey: testMovieProviderItemKey,
+			WatchedAt:       time.Date(2026, time.August, 6, 12, i, 0, 0, time.UTC),
+		})
+	}
+	service := NewService(repo, NewRegistry())
+	err := service.exportLocalPlays(
+		context.Background(),
+		Connection{ID: "conn-1"},
+		ServerConfig{},
+		singleBatchWatchedExporterStub{
+			watchedExporterStub: watchedExporterStub{exported: &exported},
+			batchSize:           1,
+		},
+		plays,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if repo.historyLookupLimit != 1 {
+		t.Fatalf("history lookup limit = %d, want 1", repo.historyLookupLimit)
+	}
+	if len(exported) != 1 {
+		t.Fatalf("exported %d plays, want 1", len(exported))
 	}
 }
 

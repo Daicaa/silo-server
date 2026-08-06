@@ -49,14 +49,13 @@ type watchStateImporter interface {
 const (
 	manualSyncCooldown = time.Hour
 	manualSyncTimeout  = 10 * time.Minute
-	// Built-in providers bind requests to this context and use HTTP client
-	// timeouts of at most 20 seconds. Keep dispatch below the reclaim lease;
-	// the per-session queue remains occupied until the worker itself exits.
 	// A completed stop may require a cold metadata lookup in a provider plugin.
 	// Match the plugin-host watch-sync deadline so the durable confirmation path
-	// does not cancel valid provider work before the RPC can finish.
+	// does not cancel valid provider work before the RPC can finish. The reclaim
+	// lease must remain longer than that entire dispatch and finalization window
+	// so a second request cannot take over while the first is still valid.
 	confirmedStopDispatchTimeout = 2 * time.Minute
-	confirmedStopLease           = time.Minute
+	confirmedStopLease           = confirmedStopDispatchTimeout + 30*time.Second
 )
 
 var errConfirmedStopInProgress = errors.New("watch provider stop confirmation already in progress")
@@ -1544,7 +1543,12 @@ func (s *Service) exportLocalPlays(
 	// A live watch event must not wait behind a connection's historical
 	// backlog. Scheduled sync still drains that backlog oldest-first, while
 	// this path selects only the events the user just created.
-	pending, err := s.repo.ListPendingHistoryExportsByHistoryIDs(ctx, conn.ID, historyIDs)
+	pending, err := s.repo.ListPendingHistoryExportsByHistoryIDs(
+		ctx,
+		conn.ID,
+		historyIDs,
+		watchedExportBatchSize(exporter, len(historyIDs)),
+	)
 	if err != nil {
 		return err
 	}
@@ -1637,18 +1641,23 @@ func (s *Service) persistConnectionError(ctx context.Context, conn Connection, m
 }
 
 func limitWatchedExportBatch(exporter WatchedExporter, plays []LocalPlay) ([]LocalPlay, bool) {
-	bounded, ok := exporter.(singleBatchWatchedExporter)
+	_, ok := exporter.(singleBatchWatchedExporter)
 	if !ok {
 		return plays, false
 	}
-	limit := bounded.ExportBatchSize()
-	if limit <= 0 {
-		limit = 1
-	}
+	limit := watchedExportBatchSize(exporter, len(plays))
 	if len(plays) > limit {
 		plays = plays[:limit]
 	}
 	return plays, true
+}
+
+func watchedExportBatchSize(exporter WatchedExporter, fallback int) int {
+	bounded, ok := exporter.(singleBatchWatchedExporter)
+	if !ok {
+		return max(1, fallback)
+	}
+	return max(1, bounded.ExportBatchSize())
 }
 
 func reconcileHistoryExports(connectionID string, local []LocalPlay, remote []RemotePlay) []HistoryExport {

@@ -348,6 +348,147 @@ func TestPluginProviderRejectsUnresolvableDynamicConnectionOptions(t *testing.T)
 	}
 }
 
+func TestPluginProviderRejectsDuplicateConnectionConfigKeys(t *testing.T) {
+	_, err := NewPluginProvider(PluginProviderOptions{
+		InstallationID: 4, ProviderKey: testPluginProviderKey, CapabilityID: testPluginCapabilityID,
+		Descriptor: &pluginv1.WatchSyncProviderDescriptor{AuthMethods: []pluginv1.WatchSyncAuthMethod{
+			pluginv1.WatchSyncAuthMethod_WATCH_SYNC_AUTH_METHOD_API_KEY,
+		}},
+		ConnectionConfigSchema: []*pluginv1.ConfigSchema{
+			{Key: "server", JsonSchema: `{"type":"object","properties":{}}`},
+			{Key: "server", JsonSchema: `{"type":"object","properties":{}}`},
+		},
+		ResolveClient: func(context.Context, int, string) (WatchSyncPluginClient, error) {
+			return &fakeWatchSyncPluginClient{}, nil
+		},
+	})
+	if err == nil || !strings.Contains(err.Error(), "duplicated") {
+		t.Fatalf("error = %v", err)
+	}
+}
+
+func TestPluginProviderRejectsUnsupportedConnectionConfigExclusivity(t *testing.T) {
+	_, err := NewPluginProvider(PluginProviderOptions{
+		InstallationID: 4, ProviderKey: testPluginProviderKey, CapabilityID: testPluginCapabilityID,
+		Descriptor: &pluginv1.WatchSyncProviderDescriptor{AuthMethods: []pluginv1.WatchSyncAuthMethod{
+			pluginv1.WatchSyncAuthMethod_WATCH_SYNC_AUTH_METHOD_API_KEY,
+		}},
+		ConnectionConfigSchema: []*pluginv1.ConfigSchema{{
+			Key: "server", JsonSchema: `{"type":"object","properties":{"primary":{"type":"boolean"},"group":{"type":"string"}}}`,
+			AdminForm: &pluginv1.AdminFormDescriptor{Fields: []*pluginv1.AdminFormField{{
+				Key: "primary", Control: pluginv1.AdminFormControl_ADMIN_FORM_CONTROL_SWITCH,
+				ExclusiveGroupField: "group",
+			}}},
+		}},
+		ResolveClient: func(context.Context, int, string) (WatchSyncPluginClient, error) {
+			return &fakeWatchSyncPluginClient{}, nil
+		},
+	})
+	if err == nil || !strings.Contains(err.Error(), "exclusive_group_field") {
+		t.Fatalf("error = %v", err)
+	}
+}
+
+func TestPluginProviderRejectsRequiredConnectionConfigTheWebCannotRender(t *testing.T) {
+	_, err := NewPluginProvider(PluginProviderOptions{
+		InstallationID: 4, ProviderKey: testPluginProviderKey, CapabilityID: testPluginCapabilityID,
+		Descriptor: &pluginv1.WatchSyncProviderDescriptor{AuthMethods: []pluginv1.WatchSyncAuthMethod{
+			pluginv1.WatchSyncAuthMethod_WATCH_SYNC_AUTH_METHOD_API_KEY,
+		}},
+		ConnectionConfigSchema: []*pluginv1.ConfigSchema{{
+			Key: "server", Required: true,
+			JsonSchema: `{"type":"object","properties":{"headers":{"type":"object"}}}`,
+		}},
+		ResolveClient: func(context.Context, int, string) (WatchSyncPluginClient, error) {
+			return &fakeWatchSyncPluginClient{}, nil
+		},
+	})
+	if err == nil || !strings.Contains(err.Error(), "cannot be inferred") {
+		t.Fatalf("error = %v", err)
+	}
+}
+
+func TestPluginProviderAcceptsRequiredScalarFieldsMissingFromPartialAdminForm(t *testing.T) {
+	_, err := NewPluginProvider(PluginProviderOptions{
+		InstallationID: 4, ProviderKey: testPluginProviderKey, CapabilityID: testPluginCapabilityID,
+		Descriptor: &pluginv1.WatchSyncProviderDescriptor{AuthMethods: []pluginv1.WatchSyncAuthMethod{
+			pluginv1.WatchSyncAuthMethod_WATCH_SYNC_AUTH_METHOD_API_KEY,
+		}},
+		ConnectionConfigSchema: []*pluginv1.ConfigSchema{
+			{
+				Key: "server", Required: true,
+				JsonSchema: `{"type":"object","properties":{"base_url":{"type":"string"},"username":{"type":"string"}},"required":["base_url","username"]}`,
+				AdminForm: &pluginv1.AdminFormDescriptor{Fields: []*pluginv1.AdminFormField{{
+					Key: "base_url", Control: pluginv1.AdminFormControl_ADMIN_FORM_CONTROL_TEXT,
+				}}},
+			},
+			{
+				Key: "features", Required: true,
+				JsonSchema: `{"type":"object","properties":{"flags":{"type":"array","items":{"type":"boolean"}}}}`,
+				AdminForm: &pluginv1.AdminFormDescriptor{Fields: []*pluginv1.AdminFormField{{
+					Key: "flags", Control: pluginv1.AdminFormControl_ADMIN_FORM_CONTROL_MULTI_SELECT,
+					Options: []*pluginv1.AdminFormOption{{Value: "true", Label: "Enabled"}, {Value: "false", Label: "Disabled"}},
+				}}},
+			},
+		},
+		ResolveClient: func(context.Context, int, string) (WatchSyncPluginClient, error) {
+			return &fakeWatchSyncPluginClient{}, nil
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestPluginProviderEnforcesConnectionAdminFormValidation(t *testing.T) {
+	client := &fakeWatchSyncPluginClient{exchangeResponse: &pluginv1.WatchSyncCredentialResponse{
+		Credentials: &pluginv1.WatchSyncCredentials{AccessToken: testValidatedToken},
+		Account:     &pluginv1.WatchSyncAccount{ExternalSubject: "7"},
+	}}
+	provider, err := NewPluginProvider(PluginProviderOptions{
+		InstallationID: 4, ProviderKey: testPluginProviderKey, CapabilityID: testPluginCapabilityID,
+		Descriptor: &pluginv1.WatchSyncProviderDescriptor{AuthMethods: []pluginv1.WatchSyncAuthMethod{
+			pluginv1.WatchSyncAuthMethod_WATCH_SYNC_AUTH_METHOD_API_KEY,
+		}},
+		ConnectionConfigSchema: []*pluginv1.ConfigSchema{{
+			Key: "server", Required: true,
+			JsonSchema: `{"type":"object","properties":{"name":{"type":"string"},"port":{"type":"number"},"password":{"type":"string","format":"password"}},"required":["name","port","password"]}`,
+			AdminForm: &pluginv1.AdminFormDescriptor{Fields: []*pluginv1.AdminFormField{
+				{Key: "name", Control: pluginv1.AdminFormControl_ADMIN_FORM_CONTROL_TEXT, Validation: &pluginv1.AdminFormValidation{Pattern: `^[a-z]+$`, MinLength: 3, MaxLength: 8}},
+				{Key: "port", Control: pluginv1.AdminFormControl_ADMIN_FORM_CONTROL_NUMBER, Validation: &pluginv1.AdminFormValidation{HasMin: true, Min: 1, HasMax: true, Max: 65535}},
+				{Key: "password", Control: pluginv1.AdminFormControl_ADMIN_FORM_CONTROL_PASSWORD, Secret: true, Validation: &pluginv1.AdminFormValidation{MinLength: 8}},
+			}},
+		}},
+		ResolveClient: func(context.Context, int, string) (WatchSyncPluginClient, error) {
+			return client, nil
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	tests := []struct {
+		name    string
+		values  map[string]any
+		message string
+	}{
+		{name: "pattern", values: map[string]any{"name": "Bad", "port": 443.0, "password": "long-enough"}, message: "is invalid"},
+		{name: "number", values: map[string]any{"name": "good", "port": 70000.0, "password": "long-enough"}, message: "at most 65535"},
+		{name: "secret length", values: map[string]any{"name": "good", "port": 443.0, "password": "leaky"}, message: "at least 8 characters"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, _, err := provider.ConnectWithAPIKeyConfig(context.Background(), "token", ConnectionConfigValues{"server": tt.values})
+			if err == nil || !strings.Contains(err.Error(), tt.message) {
+				t.Fatalf("error = %v", err)
+			}
+			if strings.Contains(err.Error(), "leaky") {
+				t.Fatalf("secret leaked in validation error: %q", err)
+			}
+		})
+	}
+}
+
 func TestPluginProviderRejectsConnectionConfigForDeviceAuthorization(t *testing.T) {
 	_, err := NewPluginProvider(PluginProviderOptions{
 		InstallationID: 4, ProviderKey: testPluginProviderKey, CapabilityID: testPluginCapabilityID,

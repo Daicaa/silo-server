@@ -7,9 +7,11 @@ import (
 	"errors"
 	"fmt"
 	"net/url"
+	"regexp"
 	"strings"
 	"time"
 	"unicode"
+	"unicode/utf8"
 
 	pluginv1 "github.com/Silo-Server/silo-plugin-sdk/pkg/pluginproto/silo/plugin/v1"
 	publicconfig "github.com/Silo-Server/silo-plugin-sdk/pkg/pluginsdk/config"
@@ -66,6 +68,7 @@ const (
 	watchSyncUnsupportedMovieMediaMessage   = "watch sync plugin does not support movie media"
 	watchSyncUnsupportedEpisodeMediaMessage = "watch sync plugin does not support episode media"
 	watchSyncUnsupportedMediaMessage        = "watch sync plugin does not support this media type"
+	watchSyncJSONSchemaNumberType           = "number"
 )
 
 func NewPluginProvider(options PluginProviderOptions) (*PluginProvider, error) {
@@ -579,9 +582,13 @@ func (p *PluginProvider) connectionConfig(values ConnectionConfigValues) (*plugi
 			declared[schema.GetKey()] = schema
 		}
 	}
+	secrets := connectionConfigSecrets(p.connectionConfigSchema, values)
 	for key := range values {
 		if _, ok := declared[key]; !ok {
-			return nil, nil, fmt.Errorf("watch sync connection config key %q is not declared", key)
+			return nil, nil, sanitizedConnectionConfigError(
+				fmt.Errorf("watch sync connection config key %q is not declared", key),
+				secrets,
+			)
 		}
 	}
 
@@ -589,7 +596,6 @@ func (p *PluginProvider) connectionConfig(values ConnectionConfigValues) (*plugi
 		Values:       make(map[string]string),
 		SecretValues: make(map[string]string),
 	}
-	var secrets []string
 	for _, schema := range p.connectionConfigSchema {
 		if schema == nil || strings.TrimSpace(schema.GetKey()) == "" {
 			continue
@@ -602,7 +608,10 @@ func (p *PluginProvider) connectionConfig(values ConnectionConfigValues) (*plugi
 			continue
 		}
 		if err := publicconfig.ValidateValue(schema, "watch sync connection config", schema.GetKey(), value); err != nil {
-			return nil, nil, err
+			return nil, nil, sanitizedConnectionConfigError(err, secrets)
+		}
+		if err := validateConnectionAdminFormValue(schema, value); err != nil {
+			return nil, nil, sanitizedConnectionConfigError(err, secrets)
 		}
 		publicFieldNames, _ := hostplugins.ConfigSchemaFieldSets(schema)
 		publicFields := make(map[string]struct{}, len(publicFieldNames))
@@ -616,19 +625,53 @@ func (p *PluginProvider) connectionConfig(values ConnectionConfigValues) (*plugi
 			}
 			encoded, err := connectionConfigString(raw)
 			if err != nil {
-				return nil, nil, fmt.Errorf("encode watch sync connection config %q.%s: %w", schema.GetKey(), field, err)
+				return nil, nil, sanitizedConnectionConfigError(
+					fmt.Errorf("encode watch sync connection config %q.%s: %w", schema.GetKey(), field, err),
+					secrets,
+				)
 			}
 			key := schema.GetKey() + "." + field
 			if _, public := publicFields[field]; public {
 				result.Values[key] = encoded
 			} else {
 				result.SecretValues[key] = encoded
-				secrets = append(secrets, encoded)
-				secrets = append(secrets, connectionConfigSecretStrings(raw)...)
 			}
 		}
 	}
 	return result, secrets, nil
+}
+
+func connectionConfigSecrets(schemas []*pluginv1.ConfigSchema, values ConnectionConfigValues) []string {
+	var secrets []string
+	for _, schema := range schemas {
+		if schema == nil {
+			continue
+		}
+		value, exists := values[schema.GetKey()]
+		if !exists {
+			continue
+		}
+		_, secretFields := hostplugins.ConfigSchemaFieldSets(schema)
+		for _, field := range secretFields {
+			raw, exists := value[field]
+			if !exists {
+				continue
+			}
+			if encoded, err := connectionConfigString(raw); err == nil && strings.TrimSpace(encoded) != "" {
+				secrets = append(secrets, encoded)
+			}
+			secrets = append(secrets, connectionConfigSecretStrings(raw)...)
+		}
+	}
+	return secrets
+}
+
+func sanitizedConnectionConfigError(err error, secrets []string) error {
+	return errors.New(sanitizeWatchSyncMessage(
+		err.Error(),
+		"watch sync connection config is invalid",
+		secrets...,
+	))
 }
 
 func connectionConfigSecretStrings(value any) []string {
@@ -655,22 +698,179 @@ func connectionConfigSecretStrings(value any) []string {
 }
 
 func validateWatchSyncConnectionConfigSchemas(schemas []*pluginv1.ConfigSchema) error {
+	seen := make(map[string]struct{}, len(schemas))
 	for _, schema := range schemas {
-		if schema == nil || schema.GetAdminForm() == nil {
+		if schema == nil {
+			continue
+		}
+		key := strings.TrimSpace(schema.GetKey())
+		if _, exists := seen[key]; exists {
+			return fmt.Errorf("connection config key %q is duplicated", key)
+		}
+		seen[key] = struct{}{}
+		if schema.GetRequired() {
+			if err := validateRequiredConnectionSchemaIsRenderable(schema); err != nil {
+				return err
+			}
+		}
+		if schema.GetAdminForm() == nil {
 			continue
 		}
 		for _, field := range schema.GetAdminForm().GetFields() {
-			if field == nil || !field.GetDynamicOptions() || len(field.GetOptions()) > 0 {
+			if field == nil {
 				continue
 			}
-			return fmt.Errorf(
-				"connection config %q field %q requires dynamic options, which watch provider setup does not support",
-				schema.GetKey(),
-				field.GetKey(),
-			)
+			if strings.TrimSpace(field.GetExclusiveGroupField()) != "" {
+				return fmt.Errorf(
+					"connection config %q field %q uses exclusive_group_field, which watch provider setup does not support",
+					schema.GetKey(),
+					field.GetKey(),
+				)
+			}
+			if field.GetDynamicOptions() && len(field.GetOptions()) == 0 {
+				return fmt.Errorf(
+					"connection config %q field %q requires dynamic options, which watch provider setup does not support",
+					schema.GetKey(),
+					field.GetKey(),
+				)
+			}
+			if pattern := field.GetValidation().GetPattern(); pattern != "" {
+				if _, err := regexp.Compile(pattern); err != nil {
+					return fmt.Errorf(
+						"connection config %q field %q has invalid validation pattern: %w",
+						schema.GetKey(),
+						field.GetKey(),
+						err,
+					)
+				}
+			}
 		}
 	}
 	return nil
+}
+
+func validateRequiredConnectionSchemaIsRenderable(schema *pluginv1.ConfigSchema) error {
+	var document struct {
+		Type       string `json:"type"`
+		Properties map[string]struct {
+			Type  string `json:"type"`
+			Items *struct {
+				Type string `json:"type"`
+			} `json:"items"`
+		} `json:"properties"`
+	}
+	if err := json.Unmarshal([]byte(schema.GetJsonSchema()), &document); err != nil {
+		return fmt.Errorf("connection config %q has invalid json_schema: %w", schema.GetKey(), err)
+	}
+	if document.Type != "object" || document.Properties == nil {
+		return fmt.Errorf("required connection config %q must have a renderable object json_schema", schema.GetKey())
+	}
+	explicit := make(map[string]*pluginv1.AdminFormField)
+	if form := schema.GetAdminForm(); form != nil {
+		for _, field := range form.GetFields() {
+			if field != nil {
+				explicit[field.GetKey()] = field
+			}
+		}
+	}
+	for key, property := range document.Properties {
+		switch property.Type {
+		case "string", watchSyncJSONSchemaNumberType, "integer", "boolean":
+			continue
+		case "array":
+			field := explicit[key]
+			if field != nil && field.GetControl() == pluginv1.AdminFormControl_ADMIN_FORM_CONTROL_MULTI_SELECT &&
+				(property.Items == nil || property.Items.Type == "string" || property.Items.Type == watchSyncJSONSchemaNumberType ||
+					property.Items.Type == "integer" || property.Items.Type == "boolean") {
+				continue
+			}
+		default:
+		}
+		return fmt.Errorf(
+			"required connection config %q property %q needs a renderable admin_form field because type %q cannot be inferred",
+			schema.GetKey(),
+			key,
+			property.Type,
+		)
+	}
+	return nil
+}
+
+func validateConnectionAdminFormValue(schema *pluginv1.ConfigSchema, value map[string]any) error {
+	if schema == nil || schema.GetAdminForm() == nil {
+		return nil
+	}
+	for _, field := range schema.GetAdminForm().GetFields() {
+		if field == nil || field.GetValidation() == nil {
+			continue
+		}
+		raw, exists := value[field.GetKey()]
+		if !exists || raw == nil {
+			continue
+		}
+		validation := field.GetValidation()
+		if text, ok := raw.(string); ok {
+			if pattern := validation.GetPattern(); pattern != "" {
+				matched, err := regexp.MatchString(pattern, text)
+				if err != nil {
+					return fmt.Errorf("connection config %q field %q has an invalid validation pattern", schema.GetKey(), field.GetKey())
+				}
+				if !matched {
+					return fmt.Errorf("connection config %q field %q is invalid", schema.GetKey(), field.GetKey())
+				}
+			}
+			length := utf8.RuneCountInString(text)
+			if minimum := int(validation.GetMinLength()); minimum > 0 && length < minimum {
+				return fmt.Errorf("connection config %q field %q must be at least %d characters", schema.GetKey(), field.GetKey(), minimum)
+			}
+			if maximum := int(validation.GetMaxLength()); maximum > 0 && length > maximum {
+				return fmt.Errorf("connection config %q field %q must be at most %d characters", schema.GetKey(), field.GetKey(), maximum)
+			}
+		}
+		if number, ok := connectionConfigNumber(raw); ok {
+			if validation.GetHasMin() && number < validation.GetMin() {
+				return fmt.Errorf("connection config %q field %q must be at least %g", schema.GetKey(), field.GetKey(), validation.GetMin())
+			}
+			if validation.GetHasMax() && number > validation.GetMax() {
+				return fmt.Errorf("connection config %q field %q must be at most %g", schema.GetKey(), field.GetKey(), validation.GetMax())
+			}
+		}
+	}
+	return nil
+}
+
+func connectionConfigNumber(value any) (float64, bool) {
+	switch typed := value.(type) {
+	case float64:
+		return typed, true
+	case float32:
+		return float64(typed), true
+	case int:
+		return float64(typed), true
+	case int8:
+		return float64(typed), true
+	case int16:
+		return float64(typed), true
+	case int32:
+		return float64(typed), true
+	case int64:
+		return float64(typed), true
+	case uint:
+		return float64(typed), true
+	case uint8:
+		return float64(typed), true
+	case uint16:
+		return float64(typed), true
+	case uint32:
+		return float64(typed), true
+	case uint64:
+		return float64(typed), true
+	case json.Number:
+		number, err := typed.Float64()
+		return number, err == nil
+	default:
+		return 0, false
+	}
 }
 
 func connectionConfigString(value any) (string, error) {

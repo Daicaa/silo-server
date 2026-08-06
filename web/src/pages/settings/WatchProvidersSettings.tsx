@@ -679,7 +679,9 @@ function WatchProviderCard({ providerKey }: { providerKey: string }) {
                 description="When you mark something unwatched, remove matching history from this provider."
                 checked={connection.export_unwatched_enabled}
                 disabled={isBusy}
-                onChange={(checked) => updateConnection.mutate({ export_unwatched_enabled: checked })}
+                onChange={(checked) =>
+                  updateConnection.mutate({ export_unwatched_enabled: checked })
+                }
               />
             ) : null}
             {connection.capabilities.import_favorites ||

@@ -34,7 +34,7 @@ type Repository interface {
 	ListListEventConnections(ctx context.Context, userID int, profileID string, list ListKind) ([]Connection, error)
 	UpsertHistoryExports(ctx context.Context, exports []HistoryExport) error
 	ListPendingHistoryExports(ctx context.Context, connectionID string, limit int) ([]HistoryExport, error)
-	ListPendingHistoryExportsByHistoryIDs(ctx context.Context, connectionID string, historyIDs []string) ([]HistoryExport, error)
+	ListPendingHistoryExportsByHistoryIDs(ctx context.Context, connectionID string, historyIDs []string, limit int) ([]HistoryExport, error)
 	MarkHistoryExportStatus(ctx context.Context, id string, status string, lastError string) error
 	MarkHistoryExportSatisfiedByScrobble(ctx context.Context, connectionID string, historyID string) error
 	UpsertListItemStates(ctx context.Context, states []ListItemState) error
@@ -770,9 +770,13 @@ func (r *PostgresRepository) ListPendingHistoryExportsByHistoryIDs(
 	ctx context.Context,
 	connectionID string,
 	historyIDs []string,
+	limit int,
 ) ([]HistoryExport, error) {
 	if len(historyIDs) == 0 {
 		return nil, nil
+	}
+	if limit <= 0 || limit > len(historyIDs) {
+		limit = len(historyIDs)
 	}
 	rows, err := r.pool.Query(ctx, `
 		SELECT id::text, connection_id::text, history_id, media_item_id, watched_at,
@@ -783,7 +787,8 @@ func (r *PostgresRepository) ListPendingHistoryExportsByHistoryIDs(
 		  AND status IN ('pending', 'failed')
 		  AND attempt_count < 5
 		ORDER BY watched_at ASC
-	`, connectionID, historyIDs)
+		LIMIT $3
+	`, connectionID, historyIDs, limit)
 	if err != nil {
 		return nil, fmt.Errorf("list pending history exports by history ids: %w", err)
 	}
