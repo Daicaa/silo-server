@@ -218,12 +218,14 @@ function AuthCodeBlock({
 
 function APIKeyBlock({
   displayName,
+  providerKey,
   configSchemas,
   pending,
   onSubmit,
   onCancel,
 }: {
   displayName: string;
+  providerKey: string;
   configSchemas: PluginConfigSchema[];
   pending: boolean;
   onSubmit: (apiKey: string, connectionConfig: WatchProviderConnectionConfig) => void;
@@ -233,25 +235,27 @@ function APIKeyBlock({
   const [connectionConfig, setConnectionConfig] = useState<WatchProviderConnectionConfig>({});
   const [configValidity, setConfigValidity] = useState<Record<string, boolean>>({});
   const trimmed = value.trim();
-  const configValid = configSchemas.every(
+  const renderableSchemas = configSchemas.filter(
+    (
+      schema,
+    ): schema is PluginConfigSchema & {
+      admin_form: NonNullable<PluginConfigSchema["admin_form"]>;
+    } => schema.admin_form != null,
+  );
+  const configValid = renderableSchemas.every(
     (schema) => configValidity[schema.key] ?? !schema.required,
   );
 
   const configuredValues = () =>
     Object.fromEntries(
-      configSchemas.flatMap((schema) => {
-        if (!schema.admin_form) return [];
-        return [
-          [
-            schema.key,
-            buildSchemaValues(
-              schema.admin_form,
-              connectionConfig[schema.key] ?? {},
-              parseFieldTypes(schema.json_schema),
-            ),
-          ],
-        ];
-      }),
+      renderableSchemas.map((schema) => [
+        schema.key,
+        buildSchemaValues(
+          schema.admin_form,
+          connectionConfig[schema.key] ?? {},
+          parseFieldTypes(schema.json_schema),
+        ),
+      ]),
     );
 
   return (
@@ -273,31 +277,29 @@ function APIKeyBlock({
           <X className="h-4 w-4" />
         </Button>
       </div>
-      {configSchemas.map((schema) =>
-        schema.admin_form ? (
-          <div key={schema.key} className="mt-4 space-y-2">
-            <div>
-              <div className="text-sm font-medium">{schema.title || schema.key}</div>
-              {schema.description ? (
-                <div className="text-muted-foreground mt-0.5 text-xs leading-snug">
-                  {schema.description}
-                </div>
-              ) : null}
-            </div>
-            <SchemaForm
-              descriptor={schema.admin_form}
-              values={connectionConfig[schema.key] ?? {}}
-              onChange={(next) =>
-                setConnectionConfig((current) => ({ ...current, [schema.key]: next }))
-              }
-              idPrefix={`watch-provider-${schema.key}`}
-              onValidityChange={(valid) =>
-                setConfigValidity((current) => ({ ...current, [schema.key]: valid }))
-              }
-            />
+      {renderableSchemas.map((schema) => (
+        <div key={schema.key} className="mt-4 space-y-2">
+          <div>
+            <div className="text-sm font-medium">{schema.title || schema.key}</div>
+            {schema.description ? (
+              <div className="text-muted-foreground mt-0.5 text-xs leading-snug">
+                {schema.description}
+              </div>
+            ) : null}
           </div>
-        ) : null,
-      )}
+          <SchemaForm
+            descriptor={schema.admin_form}
+            values={connectionConfig[schema.key] ?? {}}
+            onChange={(next) =>
+              setConnectionConfig((current) => ({ ...current, [schema.key]: next }))
+            }
+            idPrefix={`watch-provider-${providerKey}-${schema.key}`}
+            onValidityChange={(valid) =>
+              setConfigValidity((current) => ({ ...current, [schema.key]: valid }))
+            }
+          />
+        </div>
+      ))}
       <div className="mt-3 flex flex-col gap-2 sm:flex-row sm:items-stretch">
         <Input
           type="password"
@@ -605,6 +607,7 @@ function WatchProviderCard({ providerKey }: { providerKey: string }) {
         <div className="mt-4">
           <APIKeyBlock
             displayName={displayName}
+            providerKey={providerKey}
             configSchemas={connection.connection_config_schema ?? []}
             pending={connectAPIKey.isPending}
             onSubmit={handleSubmitAPIKey}
