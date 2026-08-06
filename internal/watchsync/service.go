@@ -52,7 +52,10 @@ const (
 	// Built-in providers bind requests to this context and use HTTP client
 	// timeouts of at most 20 seconds. Keep dispatch below the reclaim lease;
 	// the per-session queue remains occupied until the worker itself exits.
-	confirmedStopDispatchTimeout = 25 * time.Second
+	// A completed stop may require a cold metadata lookup in a provider plugin.
+	// Match the plugin-host watch-sync deadline so the durable confirmation path
+	// does not cancel valid provider work before the RPC can finish.
+	confirmedStopDispatchTimeout = 2 * time.Minute
 	confirmedStopLease           = time.Minute
 )
 
