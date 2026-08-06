@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"net/url"
 	"regexp"
+	"strconv"
 	"strings"
 	"time"
 	"unicode"
@@ -774,17 +775,24 @@ func validateRequiredConnectionSchemaIsRenderable(schema *pluginv1.ConfigSchema)
 		}
 	}
 	for key, property := range document.Properties {
+		field := explicit[key]
 		switch property.Type {
 		case "string", watchSyncJSONSchemaNumberType, "integer", "boolean":
 			continue
 		case "array":
-			field := explicit[key]
 			if field != nil && field.GetControl() == pluginv1.AdminFormControl_ADMIN_FORM_CONTROL_MULTI_SELECT &&
 				(property.Items == nil || property.Items.Type == "string" || property.Items.Type == watchSyncJSONSchemaNumberType ||
 					property.Items.Type == "integer" || property.Items.Type == "boolean") {
 				continue
 			}
 		default:
+			// A property whose shape comes from enum/const/$ref cannot be
+			// inferred from type alone, but an explicit scalar form control is
+			// still a complete input mechanism. Direct object properties remain
+			// unsupported because none of these controls produces an object.
+			if property.Type != "object" && connectionAdminFieldRendersValue(field) {
+				continue
+			}
 		}
 		return fmt.Errorf(
 			"required connection config %q property %q needs a renderable admin_form field because type %q cannot be inferred",
@@ -794,6 +802,24 @@ func validateRequiredConnectionSchemaIsRenderable(schema *pluginv1.ConfigSchema)
 		)
 	}
 	return nil
+}
+
+func connectionAdminFieldRendersValue(field *pluginv1.AdminFormField) bool {
+	if field == nil {
+		return false
+	}
+	switch field.GetControl() {
+	case pluginv1.AdminFormControl_ADMIN_FORM_CONTROL_TEXT,
+		pluginv1.AdminFormControl_ADMIN_FORM_CONTROL_TEXTAREA,
+		pluginv1.AdminFormControl_ADMIN_FORM_CONTROL_PASSWORD,
+		pluginv1.AdminFormControl_ADMIN_FORM_CONTROL_NUMBER,
+		pluginv1.AdminFormControl_ADMIN_FORM_CONTROL_SWITCH,
+		pluginv1.AdminFormControl_ADMIN_FORM_CONTROL_SELECT,
+		pluginv1.AdminFormControl_ADMIN_FORM_CONTROL_MULTI_SELECT:
+		return true
+	default:
+		return false
+	}
 }
 
 func validateConnectionAdminFormValue(schema *pluginv1.ConfigSchema, value map[string]any) error {
@@ -867,6 +893,9 @@ func connectionConfigNumber(value any) (float64, bool) {
 		return float64(typed), true
 	case json.Number:
 		number, err := typed.Float64()
+		return number, err == nil
+	case string:
+		number, err := strconv.ParseFloat(strings.TrimSpace(typed), 64)
 		return number, err == nil
 	default:
 		return 0, false

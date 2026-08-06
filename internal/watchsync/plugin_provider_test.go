@@ -398,6 +398,9 @@ func TestPluginProviderRejectsRequiredConnectionConfigTheWebCannotRender(t *test
 		ConnectionConfigSchema: []*pluginv1.ConfigSchema{{
 			Key: "server", Required: true,
 			JsonSchema: `{"type":"object","properties":{"headers":{"type":"object"}}}`,
+			AdminForm: &pluginv1.AdminFormDescriptor{Fields: []*pluginv1.AdminFormField{{
+				Key: "headers", Control: pluginv1.AdminFormControl_ADMIN_FORM_CONTROL_TEXTAREA,
+			}}},
 		}},
 		ResolveClient: func(context.Context, int, string) (WatchSyncPluginClient, error) {
 			return &fakeWatchSyncPluginClient{}, nil
@@ -408,7 +411,7 @@ func TestPluginProviderRejectsRequiredConnectionConfigTheWebCannotRender(t *test
 	}
 }
 
-func TestPluginProviderAcceptsRequiredScalarFieldsMissingFromPartialAdminForm(t *testing.T) {
+func TestPluginProviderAcceptsRenderableRequiredConnectionConfig(t *testing.T) {
 	_, err := NewPluginProvider(PluginProviderOptions{
 		InstallationID: 4, ProviderKey: testPluginProviderKey, CapabilityID: testPluginCapabilityID,
 		Descriptor: &pluginv1.WatchSyncProviderDescriptor{AuthMethods: []pluginv1.WatchSyncAuthMethod{
@@ -428,6 +431,21 @@ func TestPluginProviderAcceptsRequiredScalarFieldsMissingFromPartialAdminForm(t 
 				AdminForm: &pluginv1.AdminFormDescriptor{Fields: []*pluginv1.AdminFormField{{
 					Key: "flags", Control: pluginv1.AdminFormControl_ADMIN_FORM_CONTROL_MULTI_SELECT,
 					Options: []*pluginv1.AdminFormOption{{Value: "true", Label: "Enabled"}, {Value: "false", Label: "Disabled"}},
+				}}},
+			},
+			{
+				Key: "mode", Required: true,
+				JsonSchema: `{"type":"object","properties":{"value":{"enum":["standard","anime"]}}}`,
+				AdminForm: &pluginv1.AdminFormDescriptor{Fields: []*pluginv1.AdminFormField{{
+					Key: "value", Control: pluginv1.AdminFormControl_ADMIN_FORM_CONTROL_SELECT,
+					Options: []*pluginv1.AdminFormOption{{Value: "standard", Label: "Standard"}, {Value: "anime", Label: "Anime"}},
+				}}},
+			},
+			{
+				Key: "reference", Required: true,
+				JsonSchema: `{"type":"object","properties":{"endpoint":{"$ref":"#/$defs/endpoint"}},"$defs":{"endpoint":{"type":"string","format":"uri"}}}`,
+				AdminForm: &pluginv1.AdminFormDescriptor{Fields: []*pluginv1.AdminFormField{{
+					Key: "endpoint", Control: pluginv1.AdminFormControl_ADMIN_FORM_CONTROL_TEXT,
 				}}},
 			},
 		},
@@ -452,7 +470,7 @@ func TestPluginProviderEnforcesConnectionAdminFormValidation(t *testing.T) {
 		}},
 		ConnectionConfigSchema: []*pluginv1.ConfigSchema{{
 			Key: "server", Required: true,
-			JsonSchema: `{"type":"object","properties":{"name":{"type":"string"},"port":{"type":"number"},"password":{"type":"string","format":"password"}},"required":["name","port","password"]}`,
+			JsonSchema: `{"type":"object","properties":{"name":{"type":"string"},"port":{},"password":{"type":"string","format":"password"}},"required":["name","port","password"]}`,
 			AdminForm: &pluginv1.AdminFormDescriptor{Fields: []*pluginv1.AdminFormField{
 				{Key: "name", Control: pluginv1.AdminFormControl_ADMIN_FORM_CONTROL_TEXT, Validation: &pluginv1.AdminFormValidation{Pattern: `^[a-z]+$`, MinLength: 3, MaxLength: 8}},
 				{Key: "port", Control: pluginv1.AdminFormControl_ADMIN_FORM_CONTROL_NUMBER, Validation: &pluginv1.AdminFormValidation{HasMin: true, Min: 1, HasMax: true, Max: 65535}},
@@ -474,6 +492,7 @@ func TestPluginProviderEnforcesConnectionAdminFormValidation(t *testing.T) {
 	}{
 		{name: "pattern", values: map[string]any{"name": "Bad", "port": 443.0, "password": "long-enough"}, message: "is invalid"},
 		{name: "number", values: map[string]any{"name": "good", "port": 70000.0, "password": "long-enough"}, message: "at most 65535"},
+		{name: "numeric string", values: map[string]any{"name": "good", "port": "70000", "password": "long-enough"}, message: "at most 65535"},
 		{name: "secret length", values: map[string]any{"name": "good", "port": 443.0, "password": "leaky"}, message: "at least 8 characters"},
 	}
 	for _, tt := range tests {
