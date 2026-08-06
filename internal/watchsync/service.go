@@ -134,6 +134,9 @@ func (s *Service) GetConnectionStatus(ctx context.Context, userID int, profileID
 		SyncWatchlistOrderEnabled:    true,
 		ScrobbleEnabled:              true,
 	}
+	if configurable, ok := provider.(connectionConfigProvider); ok {
+		status.ConnectionConfigSchema = configurable.ConnectionConfigSchema()
+	}
 	if connected {
 		status.ProviderUsername = conn.ProviderUsername
 		status.ImportWatchedEnabled = conn.ImportWatchedEnabled
@@ -543,6 +546,17 @@ func (s *Service) ConnectAPIKey(
 	providerKey string,
 	apiKey string,
 ) (Connection, error) {
+	return s.ConnectAPIKeyWithConfig(ctx, userID, profileID, providerKey, apiKey, nil)
+}
+
+func (s *Service) ConnectAPIKeyWithConfig(
+	ctx context.Context,
+	userID int,
+	profileID string,
+	providerKey string,
+	apiKey string,
+	connectionConfig ConnectionConfigValues,
+) (Connection, error) {
 	if userID <= 0 {
 		return Connection{}, fmt.Errorf("user id is required")
 	}
@@ -562,7 +576,17 @@ func (s *Service) ConnectAPIKey(
 		return Connection{}, fmt.Errorf("provider %q does not support api-key auth", providerKey)
 	}
 
-	tokens, account, err := authProvider.ConnectWithAPIKey(ctx, apiKey)
+	var tokens TokenSet
+	var account ProviderAccount
+	var err error
+	if configured, ok := provider.(configuredAPIKeyAuthProvider); ok {
+		tokens, account, err = configured.ConnectWithAPIKeyConfig(ctx, apiKey, connectionConfig)
+	} else {
+		if len(connectionConfig) > 0 {
+			return Connection{}, fmt.Errorf("provider %q does not accept connection configuration", providerKey)
+		}
+		tokens, account, err = authProvider.ConnectWithAPIKey(ctx, apiKey)
+	}
 	if err != nil {
 		return Connection{}, err
 	}

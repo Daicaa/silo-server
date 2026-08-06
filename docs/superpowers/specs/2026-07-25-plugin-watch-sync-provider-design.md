@@ -25,6 +25,8 @@ rate-limit handling, list reconciliation, and scheduled reconciliation.
   expiry, and opaque secret attributes.
 - Supply declared installation configuration to provider calls without mixing
   it with profile credentials.
+- Allow API-key providers to declare setup fields that are supplied per profile
+  connection rather than forcing one installation-wide endpoint.
 - Keep provider plugins stateless and prevent credentials from entering generic
   plugin configuration.
 - Avoid behavior changes for built-in Trakt, Simkl, and MDBList providers.
@@ -117,9 +119,14 @@ The plugin never needs a Silo API key or a callback into catalog HTTP routes.
 ## Authentication and credentials
 
 The existing watch-provider API-key connection route passes the entered token
-to `ExchangeAPIKey`. Device-code providers use the existing start and poll
-routes. The plugin validates or exchanges the credential and returns normalized
-credentials plus provider account identity.
+to `ExchangeAPIKey`. A plugin capability may also declare `config_schema`
+entries; the host renders those fields beside the API key, validates submitted
+objects against the declared JSON schemas, classifies secret fields, and
+overlays the flattened values onto `provider_config` for that exchange only.
+The plugin validates or exchanges the credential and returns normalized
+credentials plus provider account identity. Provider-specific connection
+context needed by later calls is returned in encrypted opaque credential
+attributes. Device-code providers use the existing start and poll routes.
 
 Credential refresh remains host-initiated and serialized by the existing
 watchsync service. The host encrypts an authoritative credential bundle
@@ -201,6 +208,15 @@ provider call. Public fields are sent in `values`; secret and undeclared fields
 are sent in `secret_values`. Nested manifest fields use the stable
 `<config-key>.<field>` key form, such as `floppy.base_url`. Profile credentials
 remain separate and encrypted in watch-provider connection storage.
+
+Capability-level `config_schema` entries are connection setup fields, not
+installation defaults. For API-key authorization, the host validates and
+flattens them using the same `<config-key>.<field>` convention and lets the
+connection values override a same-named global value. This supports migrations
+from a legacy installation-wide endpoint while ensuring every new connection
+chooses its own endpoint. The submitted objects are not retained as generic
+plugin configuration; the plugin returns any context required after exchange
+inside its opaque encrypted credentials.
 
 ## Apply result handling
 

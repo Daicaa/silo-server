@@ -34,6 +34,7 @@ type fakeWatchSyncPluginClient struct {
 	listResponses       []*pluginv1.WatchSyncListRemoteStateResponse
 	applyErr            error
 	applyRequest        *pluginv1.WatchSyncApplyEventsRequest
+	exchangeRequest     *pluginv1.WatchSyncExchangeAPIKeyRequest
 	refreshRequest      *pluginv1.WatchSyncRefreshCredentialsRequest
 	accountRequest      *pluginv1.WatchSyncGetAccountRequest
 	deviceStartRequest  *pluginv1.WatchSyncDeviceAuthorizationServiceStartRequest
@@ -57,7 +58,8 @@ func (f *fakeWatchSyncPluginClient) PollDeviceAuthorization(_ context.Context, r
 	return &pluginv1.WatchSyncDeviceAuthorizationServicePollResponse{}, nil
 }
 
-func (f *fakeWatchSyncPluginClient) ExchangeAPIKey(_ context.Context, _ *pluginv1.WatchSyncExchangeAPIKeyRequest) (*pluginv1.WatchSyncCredentialResponse, error) {
+func (f *fakeWatchSyncPluginClient) ExchangeAPIKey(_ context.Context, req *pluginv1.WatchSyncExchangeAPIKeyRequest) (*pluginv1.WatchSyncCredentialResponse, error) {
+	f.exchangeRequest = req
 	return f.exchangeResponse, nil
 }
 func (f *fakeWatchSyncPluginClient) RefreshCredentials(_ context.Context, req *pluginv1.WatchSyncRefreshCredentialsRequest) (*pluginv1.WatchSyncCredentialResponse, error) {
@@ -212,6 +214,50 @@ func TestPluginProviderRejectsMissingAccountIdentity(t *testing.T) {
 		if _, _, err := provider.ConnectWithAPIKey(context.Background(), "input-token"); err == nil || !strings.Contains(err.Error(), "account identity") {
 			t.Fatalf("subject %q: error = %v", subject, err)
 		}
+	}
+}
+
+func TestPluginProviderValidatesAndOverlaysConnectionConfig(t *testing.T) {
+	client := &fakeWatchSyncPluginClient{exchangeResponse: &pluginv1.WatchSyncCredentialResponse{
+		Credentials: &pluginv1.WatchSyncCredentials{AccessToken: testValidatedToken, TokenType: testBearerTokenType},
+		Account:     &pluginv1.WatchSyncAccount{ExternalSubject: "7", Username: testPluginUsername},
+	}}
+	schema := &pluginv1.ConfigSchema{
+		Key: "floppy", Title: "Floppy server", Required: true,
+		JsonSchema: `{"type":"object","properties":{"base_url":{"type":"string","format":"uri"}},"required":["base_url"],"additionalProperties":false}`,
+		AdminForm: &pluginv1.AdminFormDescriptor{Fields: []*pluginv1.AdminFormField{{
+			Key: "base_url", Label: "Base URL", Control: pluginv1.AdminFormControl_ADMIN_FORM_CONTROL_TEXT, Required: true,
+		}}},
+	}
+	provider, err := NewPluginProvider(PluginProviderOptions{
+		InstallationID: 4, ProviderKey: testPluginProviderKey, CapabilityID: testPluginCapabilityID,
+		DisplayName: "Floppy", Descriptor: &pluginv1.WatchSyncProviderDescriptor{
+			AuthMethods: []pluginv1.WatchSyncAuthMethod{pluginv1.WatchSyncAuthMethod_WATCH_SYNC_AUTH_METHOD_API_KEY},
+		},
+		ConnectionConfigSchema: []*pluginv1.ConfigSchema{schema},
+		ResolveClient:          func(context.Context, int, string) (WatchSyncPluginClient, error) { return client, nil },
+		ResolveConfig: func(context.Context, int) (*pluginv1.WatchSyncProviderConfig, error) {
+			return &pluginv1.WatchSyncProviderConfig{Values: map[string]string{"floppy.base_url": "https://legacy.example.com"}}, nil
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, _, err = provider.ConnectWithAPIKeyConfig(context.Background(), "token", ConnectionConfigValues{
+		"floppy": {"base_url": "https://personal.example.com"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := client.exchangeRequest.GetProviderConfig().GetValues()["floppy.base_url"]; got != "https://personal.example.com" {
+		t.Fatalf("base URL = %q", got)
+	}
+	views := provider.ConnectionConfigSchema()
+	if len(views) != 1 || views[0].AdminForm == nil || views[0].AdminForm.Fields[0].Control != "TEXT" {
+		t.Fatalf("connection config schema = %#v", views)
+	}
+	if _, _, err := provider.ConnectWithAPIKeyConfig(context.Background(), "token", nil); err == nil || !strings.Contains(err.Error(), "required") {
+		t.Fatalf("missing config error = %v", err)
 	}
 }
 

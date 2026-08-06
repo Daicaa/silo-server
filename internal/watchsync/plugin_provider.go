@@ -3,6 +3,7 @@ package watchsync
 import (
 	"context"
 	"encoding/base64"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net/url"
@@ -11,7 +12,9 @@ import (
 	"unicode"
 
 	pluginv1 "github.com/Silo-Server/silo-plugin-sdk/pkg/pluginproto/silo/plugin/v1"
+	publicconfig "github.com/Silo-Server/silo-plugin-sdk/pkg/pluginsdk/config"
 	"github.com/Silo-Server/silo-server/internal/historyimport"
+	hostplugins "github.com/Silo-Server/silo-server/internal/plugins"
 	"github.com/Silo-Server/silo-server/internal/userstore"
 	"google.golang.org/protobuf/types/known/timestamppb"
 )
@@ -34,27 +37,29 @@ type PluginCredentialRepository interface {
 }
 
 type PluginProviderOptions struct {
-	InstallationID int
-	ProviderKey    string
-	CapabilityID   string
-	DisplayName    string
-	Descriptor     *pluginv1.WatchSyncProviderDescriptor
-	ResolveClient  WatchSyncPluginClientResolver
-	ResolveConfig  WatchSyncPluginConfigResolver
-	Repository     PluginCredentialRepository
+	InstallationID         int
+	ProviderKey            string
+	CapabilityID           string
+	DisplayName            string
+	Descriptor             *pluginv1.WatchSyncProviderDescriptor
+	ConnectionConfigSchema []*pluginv1.ConfigSchema
+	ResolveClient          WatchSyncPluginClientResolver
+	ResolveConfig          WatchSyncPluginConfigResolver
+	Repository             PluginCredentialRepository
 }
 
 type PluginProvider struct {
-	installationID int
-	providerKey    string
-	capabilityID   string
-	displayName    string
-	descriptor     *pluginv1.WatchSyncProviderDescriptor
-	authMethod     string
-	supportedMedia map[pluginv1.WatchSyncMediaType]struct{}
-	resolveClient  WatchSyncPluginClientResolver
-	resolveConfig  WatchSyncPluginConfigResolver
-	repository     PluginCredentialRepository
+	installationID         int
+	providerKey            string
+	capabilityID           string
+	displayName            string
+	descriptor             *pluginv1.WatchSyncProviderDescriptor
+	connectionConfigSchema []*pluginv1.ConfigSchema
+	authMethod             string
+	supportedMedia         map[pluginv1.WatchSyncMediaType]struct{}
+	resolveClient          WatchSyncPluginClientResolver
+	resolveConfig          WatchSyncPluginConfigResolver
+	repository             PluginCredentialRepository
 }
 
 const (
@@ -85,16 +90,17 @@ func NewPluginProvider(options PluginProviderOptions) (*PluginProvider, error) {
 		return nil, fmt.Errorf("watch sync plugin client resolver is required")
 	}
 	return &PluginProvider{
-		installationID: options.InstallationID,
-		providerKey:    options.ProviderKey,
-		capabilityID:   options.CapabilityID,
-		displayName:    options.DisplayName,
-		descriptor:     options.Descriptor,
-		authMethod:     authMethod,
-		supportedMedia: supportedMedia,
-		resolveClient:  options.ResolveClient,
-		resolveConfig:  options.ResolveConfig,
-		repository:     options.Repository,
+		installationID:         options.InstallationID,
+		providerKey:            options.ProviderKey,
+		capabilityID:           options.CapabilityID,
+		displayName:            options.DisplayName,
+		descriptor:             options.Descriptor,
+		connectionConfigSchema: append([]*pluginv1.ConfigSchema(nil), options.ConnectionConfigSchema...),
+		authMethod:             authMethod,
+		supportedMedia:         supportedMedia,
+		resolveClient:          options.ResolveClient,
+		resolveConfig:          options.ResolveConfig,
+		repository:             options.Repository,
 	}, nil
 }
 
@@ -117,6 +123,10 @@ func (p *PluginProvider) HistorySource() userstore.WatchHistorySource {
 }
 
 func (p *PluginProvider) AuthMethod() string { return p.authMethod }
+
+func (p *PluginProvider) ConnectionConfigSchema() []hostplugins.ConfigSchemaView {
+	return hostplugins.ConfigSchemaViews(p.connectionConfigSchema)
+}
 
 func (p *PluginProvider) usesHostPluginConfig() {}
 
@@ -147,6 +157,14 @@ func (p *PluginProvider) Capabilities() Capabilities {
 }
 
 func (p *PluginProvider) ConnectWithAPIKey(ctx context.Context, apiKey string) (TokenSet, ProviderAccount, error) {
+	return p.ConnectWithAPIKeyConfig(ctx, apiKey, nil)
+}
+
+func (p *PluginProvider) ConnectWithAPIKeyConfig(
+	ctx context.Context,
+	apiKey string,
+	connectionConfig ConnectionConfigValues,
+) (TokenSet, ProviderAccount, error) {
 	if p.authMethod != AuthMethodAPIKey {
 		return TokenSet{}, ProviderAccount{}, errors.New("watch sync plugin does not support API-key authentication")
 	}
@@ -154,6 +172,11 @@ func (p *PluginProvider) ConnectWithAPIKey(ctx context.Context, apiKey string) (
 	if err != nil {
 		return TokenSet{}, ProviderAccount{}, err
 	}
+	connectionValues, err := p.connectionConfig(connectionConfig)
+	if err != nil {
+		return TokenSet{}, ProviderAccount{}, err
+	}
+	config = mergeWatchSyncProviderConfig(config, connectionValues)
 	client, err := p.resolveClient(ctx, p.installationID, p.capabilityID)
 	if err != nil {
 		return TokenSet{}, ProviderAccount{}, watchSyncUnavailableError()
@@ -531,6 +554,99 @@ func (p *PluginProvider) providerConfig(ctx context.Context) (*pluginv1.WatchSyn
 		config = &pluginv1.WatchSyncProviderConfig{}
 	}
 	return config, nil
+}
+
+func (p *PluginProvider) connectionConfig(values ConnectionConfigValues) (*pluginv1.WatchSyncProviderConfig, error) {
+	declared := make(map[string]*pluginv1.ConfigSchema, len(p.connectionConfigSchema))
+	for _, schema := range p.connectionConfigSchema {
+		if schema != nil && strings.TrimSpace(schema.GetKey()) != "" {
+			declared[schema.GetKey()] = schema
+		}
+	}
+	for key := range values {
+		if _, ok := declared[key]; !ok {
+			return nil, fmt.Errorf("watch sync connection config key %q is not declared", key)
+		}
+	}
+
+	result := &pluginv1.WatchSyncProviderConfig{
+		Values:       make(map[string]string),
+		SecretValues: make(map[string]string),
+	}
+	for _, schema := range p.connectionConfigSchema {
+		if schema == nil || strings.TrimSpace(schema.GetKey()) == "" {
+			continue
+		}
+		value, exists := values[schema.GetKey()]
+		if !exists {
+			if schema.GetRequired() {
+				return nil, fmt.Errorf("watch sync connection config %q is required", schema.GetKey())
+			}
+			continue
+		}
+		if err := publicconfig.ValidateValue(schema, "watch sync connection config", schema.GetKey(), value); err != nil {
+			return nil, err
+		}
+		publicFields := make(map[string]struct{})
+		if form := schema.GetAdminForm(); form != nil {
+			for _, field := range form.GetFields() {
+				if field != nil && !field.GetSecret() && field.GetControl() != pluginv1.AdminFormControl_ADMIN_FORM_CONTROL_PASSWORD {
+					publicFields[field.GetKey()] = struct{}{}
+				}
+			}
+		}
+		for field, raw := range value {
+			field = strings.TrimSpace(field)
+			if field == "" {
+				continue
+			}
+			encoded, err := connectionConfigString(raw)
+			if err != nil {
+				return nil, fmt.Errorf("encode watch sync connection config %q.%s: %w", schema.GetKey(), field, err)
+			}
+			key := schema.GetKey() + "." + field
+			if _, public := publicFields[field]; public {
+				result.Values[key] = encoded
+			} else {
+				result.SecretValues[key] = encoded
+			}
+		}
+	}
+	return result, nil
+}
+
+func connectionConfigString(value any) (string, error) {
+	if text, ok := value.(string); ok {
+		return text, nil
+	}
+	encoded, err := json.Marshal(value)
+	if err != nil {
+		return "", err
+	}
+	return string(encoded), nil
+}
+
+func mergeWatchSyncProviderConfig(base, connection *pluginv1.WatchSyncProviderConfig) *pluginv1.WatchSyncProviderConfig {
+	merged := &pluginv1.WatchSyncProviderConfig{Values: map[string]string{}, SecretValues: map[string]string{}}
+	if base != nil {
+		for key, value := range base.GetValues() {
+			merged.Values[key] = value
+		}
+		for key, value := range base.GetSecretValues() {
+			merged.SecretValues[key] = value
+		}
+	}
+	if connection != nil {
+		for key, value := range connection.GetValues() {
+			delete(merged.SecretValues, key)
+			merged.Values[key] = value
+		}
+		for key, value := range connection.GetSecretValues() {
+			delete(merged.Values, key)
+			merged.SecretValues[key] = value
+		}
+	}
+	return merged
 }
 
 func (p *PluginProvider) persistUpdatedCredentials(
