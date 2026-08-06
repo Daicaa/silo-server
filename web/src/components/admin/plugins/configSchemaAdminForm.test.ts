@@ -89,4 +89,53 @@ describe("adminFormForConfigSchema", () => {
       explicit,
     );
   });
+
+  it("applies JSON Schema sensitivity to matching explicit fields", () => {
+    const form = adminFormForConfigSchema(
+      schema({
+        json_schema: JSON.stringify({
+          type: "object",
+          properties: {
+            api_key: { type: "string", writeOnly: true },
+            password: { type: "string", format: "password" },
+            advanced: { type: "object", writeOnly: true },
+          },
+        }),
+        admin_form: {
+          fields: [
+            {
+              key: "api_key",
+              label: "API Key",
+              control: "TEXT",
+              required: false,
+              secret: false,
+              multiline: false,
+            },
+            {
+              key: "password",
+              label: "Password",
+              control: "TEXT",
+              required: false,
+              secret: false,
+              multiline: false,
+            },
+            {
+              key: "advanced",
+              label: "Advanced",
+              control: "TEXTAREA",
+              required: false,
+              secret: false,
+              multiline: true,
+            },
+          ],
+        },
+      }),
+    );
+
+    expect(form?.fields.map(({ key, secret }) => ({ key, secret }))).toEqual([
+      { key: "api_key", secret: true },
+      { key: "password", secret: true },
+      { key: "advanced", secret: true },
+    ]);
+  });
 });

@@ -68,10 +68,17 @@ export function adminFormForConfigSchema(schema: PluginConfigSchema): PluginAdmi
 
     if (explicitFields.length > 0) {
       const explicitKeys = new Set(explicitFields.map((field) => field.key));
+      const sensitiveKeys = new Set(
+        Object.entries(parsed.properties)
+          .filter(([, property]) => property.writeOnly === true || property.format === "password")
+          .map(([key]) => key),
+      );
       return {
         ...schema.admin_form,
         fields: [
-          ...explicitFields,
+          ...explicitFields.map((field) =>
+            sensitiveKeys.has(field.key) ? { ...field, secret: true } : field,
+          ),
           ...inferredFields.filter(
             (field): field is PluginAdminFormField => field != null && !explicitKeys.has(field.key),
           ),

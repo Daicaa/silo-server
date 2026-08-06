@@ -262,12 +262,10 @@ func TestPluginProviderValidatesAndOverlaysConnectionConfig(t *testing.T) {
 }
 
 func TestPluginProviderClassifiesAndRedactsConnectionSecrets(t *testing.T) {
-	const nestedSecret = "nested-connection-secret"
 	client := &fakeWatchSyncPluginClient{exchangeResponse: &pluginv1.WatchSyncCredentialResponse{
 		Fault: &pluginv1.WatchSyncFault{
-			Code: pluginv1.WatchSyncFaultCode_WATCH_SYNC_FAULT_CODE_INVALID_CREDENTIAL,
-			SafeMessage: "credentials " + testSecretValue + " and " + nestedSecret +
-				" were rejected",
+			Code:        pluginv1.WatchSyncFaultCode_WATCH_SYNC_FAULT_CODE_INVALID_CREDENTIAL,
+			SafeMessage: "credentials " + testSecretValue + " were rejected",
 		},
 	}}
 	schema := &pluginv1.ConfigSchema{
@@ -276,10 +274,9 @@ func TestPluginProviderClassifiesAndRedactsConnectionSecrets(t *testing.T) {
 			"type":"object",
 			"properties":{
 				"base_url":{"type":"string","format":"uri"},
-				"client_secret":{"type":"string","format":"password"},
-				"advanced":{"type":"object","properties":{"password":{"type":"string","format":"password"}}}
+				"client_secret":{"type":"string","format":"password"}
 			},
-			"required":["base_url","client_secret","advanced"],
+			"required":["base_url","client_secret"],
 			"additionalProperties":false
 		}`,
 		AdminForm: &pluginv1.AdminFormDescriptor{Fields: []*pluginv1.AdminFormField{
@@ -287,7 +284,6 @@ func TestPluginProviderClassifiesAndRedactsConnectionSecrets(t *testing.T) {
 			// JSON Schema remains authoritative even when a form incorrectly
 			// presents a credential as ordinary text.
 			{Key: "client_secret", Control: pluginv1.AdminFormControl_ADMIN_FORM_CONTROL_TEXT},
-			{Key: "advanced", Control: pluginv1.AdminFormControl_ADMIN_FORM_CONTROL_TEXT},
 		}},
 	}
 	provider, err := NewPluginProvider(PluginProviderOptions{
@@ -305,7 +301,6 @@ func TestPluginProviderClassifiesAndRedactsConnectionSecrets(t *testing.T) {
 		"account": {
 			"base_url":      "https://floppy.example.com",
 			"client_secret": testSecretValue,
-			"advanced":      map[string]any{"password": nestedSecret},
 		},
 	})
 	if !isWatchSyncInvalidCredentialError(err) {
@@ -313,16 +308,30 @@ func TestPluginProviderClassifiesAndRedactsConnectionSecrets(t *testing.T) {
 	}
 	config := client.exchangeRequest.GetProviderConfig()
 	if config.GetValues()["account.base_url"] != "https://floppy.example.com" ||
-		config.GetSecretValues()["account.client_secret"] != testSecretValue ||
-		config.GetSecretValues()["account.advanced"] != `{"password":"nested-connection-secret"}` {
+		config.GetSecretValues()["account.client_secret"] != testSecretValue {
 		t.Fatalf("provider config = %#v", config)
 	}
 	if _, exposed := config.GetValues()["account.client_secret"]; exposed {
 		t.Fatal("JSON-schema password was exposed as a public provider value")
 	}
-	if strings.Contains(err.Error(), testSecretValue) || strings.Contains(err.Error(), nestedSecret) ||
-		!strings.Contains(err.Error(), "[REDACTED]") {
+	if strings.Contains(err.Error(), testSecretValue) || !strings.Contains(err.Error(), "[REDACTED]") {
 		t.Fatalf("connection secrets were not redacted: %q", err)
+	}
+}
+
+func TestConnectionConfigValidationRedactsNestedSecrets(t *testing.T) {
+	const nestedSecret = "nested-connection-secret"
+	schema := &pluginv1.ConfigSchema{
+		Key:        "account",
+		JsonSchema: `{"type":"object","properties":{"advanced":{"type":"object","properties":{"password":{"type":"string","format":"password"}}}}}`,
+	}
+	secrets := connectionConfigSecrets(
+		[]*pluginv1.ConfigSchema{schema},
+		ConnectionConfigValues{"account": {"advanced": map[string]any{"password": nestedSecret}}},
+	)
+	err := sanitizedConnectionConfigError(errors.New("rejected "+nestedSecret), secrets)
+	if strings.Contains(err.Error(), nestedSecret) || !strings.Contains(err.Error(), "[REDACTED]") {
+		t.Fatalf("nested connection secret was not redacted: %q", err)
 	}
 }
 
@@ -367,6 +376,24 @@ func TestPluginProviderRejectsDuplicateConnectionConfigKeys(t *testing.T) {
 	}
 }
 
+func TestPluginProviderRejectsBlankConnectionConfigKey(t *testing.T) {
+	_, err := NewPluginProvider(PluginProviderOptions{
+		InstallationID: 4, ProviderKey: testPluginProviderKey, CapabilityID: testPluginCapabilityID,
+		Descriptor: &pluginv1.WatchSyncProviderDescriptor{AuthMethods: []pluginv1.WatchSyncAuthMethod{
+			pluginv1.WatchSyncAuthMethod_WATCH_SYNC_AUTH_METHOD_API_KEY,
+		}},
+		ConnectionConfigSchema: []*pluginv1.ConfigSchema{{
+			Key: " \t", Required: true, JsonSchema: `{"type":"object","properties":{}}`,
+		}},
+		ResolveClient: func(context.Context, int, string) (WatchSyncPluginClient, error) {
+			return &fakeWatchSyncPluginClient{}, nil
+		},
+	})
+	if err == nil || !strings.Contains(err.Error(), "key is required") {
+		t.Fatalf("error = %v", err)
+	}
+}
+
 func TestPluginProviderRejectsUnsupportedConnectionConfigExclusivity(t *testing.T) {
 	_, err := NewPluginProvider(PluginProviderOptions{
 		InstallationID: 4, ProviderKey: testPluginProviderKey, CapabilityID: testPluginCapabilityID,
@@ -401,6 +428,25 @@ func TestPluginProviderRejectsRequiredConnectionConfigTheWebCannotRender(t *test
 			AdminForm: &pluginv1.AdminFormDescriptor{Fields: []*pluginv1.AdminFormField{{
 				Key: "headers", Control: pluginv1.AdminFormControl_ADMIN_FORM_CONTROL_TEXTAREA,
 			}}},
+		}},
+		ResolveClient: func(context.Context, int, string) (WatchSyncPluginClient, error) {
+			return &fakeWatchSyncPluginClient{}, nil
+		},
+	})
+	if err == nil || !strings.Contains(err.Error(), "cannot be inferred") {
+		t.Fatalf("error = %v", err)
+	}
+}
+
+func TestPluginProviderRejectsOptionalConnectionConfigTheWebCannotRender(t *testing.T) {
+	_, err := NewPluginProvider(PluginProviderOptions{
+		InstallationID: 4, ProviderKey: testPluginProviderKey, CapabilityID: testPluginCapabilityID,
+		Descriptor: &pluginv1.WatchSyncProviderDescriptor{AuthMethods: []pluginv1.WatchSyncAuthMethod{
+			pluginv1.WatchSyncAuthMethod_WATCH_SYNC_AUTH_METHOD_API_KEY,
+		}},
+		ConnectionConfigSchema: []*pluginv1.ConfigSchema{{
+			Key:        "headers",
+			JsonSchema: `{"type":"object","properties":{"values":{"type":"object"}}}`,
 		}},
 		ResolveClient: func(context.Context, int, string) (WatchSyncPluginClient, error) {
 			return &fakeWatchSyncPluginClient{}, nil

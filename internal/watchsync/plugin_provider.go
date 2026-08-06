@@ -705,18 +705,13 @@ func validateWatchSyncConnectionConfigSchemas(schemas []*pluginv1.ConfigSchema) 
 			continue
 		}
 		key := strings.TrimSpace(schema.GetKey())
+		if key == "" {
+			return fmt.Errorf("connection config key is required")
+		}
 		if _, exists := seen[key]; exists {
 			return fmt.Errorf("connection config key %q is duplicated", key)
 		}
 		seen[key] = struct{}{}
-		if schema.GetRequired() {
-			if err := validateRequiredConnectionSchemaIsRenderable(schema); err != nil {
-				return err
-			}
-		}
-		if schema.GetAdminForm() == nil {
-			continue
-		}
 		for _, field := range schema.GetAdminForm().GetFields() {
 			if field == nil {
 				continue
@@ -746,11 +741,17 @@ func validateWatchSyncConnectionConfigSchemas(schemas []*pluginv1.ConfigSchema) 
 				}
 			}
 		}
+		if err := validateConnectionSchemaIsRenderable(schema); err != nil {
+			return err
+		}
 	}
 	return nil
 }
 
-func validateRequiredConnectionSchemaIsRenderable(schema *pluginv1.ConfigSchema) error {
+func validateConnectionSchemaIsRenderable(schema *pluginv1.ConfigSchema) error {
+	if strings.TrimSpace(schema.GetJsonSchema()) == "" && !schema.GetRequired() {
+		return nil
+	}
 	var document struct {
 		Type       string `json:"type"`
 		Properties map[string]struct {
@@ -764,7 +765,7 @@ func validateRequiredConnectionSchemaIsRenderable(schema *pluginv1.ConfigSchema)
 		return fmt.Errorf("connection config %q has invalid json_schema: %w", schema.GetKey(), err)
 	}
 	if document.Type != "object" || document.Properties == nil {
-		return fmt.Errorf("required connection config %q must have a renderable object json_schema", schema.GetKey())
+		return fmt.Errorf("connection config %q must have a renderable object json_schema", schema.GetKey())
 	}
 	explicit := make(map[string]*pluginv1.AdminFormField)
 	if form := schema.GetAdminForm(); form != nil {
@@ -795,7 +796,7 @@ func validateRequiredConnectionSchemaIsRenderable(schema *pluginv1.ConfigSchema)
 			}
 		}
 		return fmt.Errorf(
-			"required connection config %q property %q needs a renderable admin_form field because type %q cannot be inferred",
+			"connection config %q property %q needs a renderable admin_form field because type %q cannot be inferred",
 			schema.GetKey(),
 			key,
 			property.Type,
