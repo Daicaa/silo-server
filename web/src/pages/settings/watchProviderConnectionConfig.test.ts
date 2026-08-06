@@ -6,6 +6,7 @@ import {
   activeConnectionSchemas,
   buildConnectionConfig,
   connectionSchemasAreValid,
+  renderableConnectionSchemas,
 } from "./watchProviderConnectionConfig";
 
 const optionalSchema: PluginConfigSchema = {
@@ -52,5 +53,21 @@ describe("watch provider connection config", () => {
     const requiredSchema = { ...optionalSchema, key: "required", required: true };
     expect(activeConnectionSchemas([requiredSchema], {})).toEqual([requiredSchema]);
     expect(connectionSchemasAreValid([requiredSchema], {}, {})).toBe(false);
+  });
+
+  it("derives a usable form for a required JSON-schema-only block", () => {
+    const headless = { ...optionalSchema, required: true, admin_form: undefined };
+    const schemas = renderableConnectionSchemas([headless]);
+    expect(schemas).toHaveLength(1);
+    const renderable = schemas[0]!;
+    expect(renderable.admin_form.fields).toEqual([
+      expect.objectContaining({
+        key: "base_url",
+        label: "Base Url",
+        control: "TEXT",
+        required: true,
+      }),
+    ]);
+    expect(connectionSchemasAreValid([renderable], {}, {})).toBe(false);
   });
 });

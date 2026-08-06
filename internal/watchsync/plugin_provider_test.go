@@ -348,6 +348,22 @@ func TestPluginProviderRejectsUnresolvableDynamicConnectionOptions(t *testing.T)
 	}
 }
 
+func TestPluginProviderRejectsConnectionConfigForDeviceAuthorization(t *testing.T) {
+	_, err := NewPluginProvider(PluginProviderOptions{
+		InstallationID: 4, ProviderKey: testPluginProviderKey, CapabilityID: testPluginCapabilityID,
+		Descriptor: &pluginv1.WatchSyncProviderDescriptor{AuthMethods: []pluginv1.WatchSyncAuthMethod{
+			pluginv1.WatchSyncAuthMethod_WATCH_SYNC_AUTH_METHOD_DEVICE_CODE,
+		}},
+		ConnectionConfigSchema: []*pluginv1.ConfigSchema{{Key: "server"}},
+		ResolveClient: func(context.Context, int, string) (WatchSyncPluginClient, error) {
+			return &fakeWatchSyncPluginClient{}, nil
+		},
+	})
+	if err == nil || !strings.Contains(err.Error(), "connection config requires API-key authentication") {
+		t.Fatalf("error = %v", err)
+	}
+}
+
 func TestPluginProviderRefreshReturnsCredentialsAlongsideFault(t *testing.T) {
 	client := &fakeWatchSyncPluginClient{refreshResponse: &pluginv1.WatchSyncCredentialResponse{
 		Credentials: &pluginv1.WatchSyncCredentials{AccessToken: testRotatedAccessToken, TokenType: testBearerTokenType},

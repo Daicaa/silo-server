@@ -1,10 +1,20 @@
 import type { PluginConfigSchema } from "@/api/types";
+import { adminFormForConfigSchema } from "@/components/admin/plugins/configSchemaAdminForm";
 import { buildSchemaValues, parseFieldTypes } from "@/components/admin/plugins/schemaFormUtils";
 import type { WatchProviderConnectionConfig } from "@/hooks/queries/watchProviders";
 
 export type RenderableConnectionSchema = PluginConfigSchema & {
   admin_form: NonNullable<PluginConfigSchema["admin_form"]>;
 };
+
+export function renderableConnectionSchemas(
+  schemas: PluginConfigSchema[],
+): RenderableConnectionSchema[] {
+  return schemas.flatMap((schema) => {
+    const adminForm = adminFormForConfigSchema(schema);
+    return adminForm == null ? [] : [{ ...schema, admin_form: adminForm }];
+  });
+}
 
 function hasEnteredValue(value: unknown): boolean {
   if (value == null) return false;

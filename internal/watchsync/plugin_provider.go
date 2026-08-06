@@ -89,6 +89,9 @@ func NewPluginProvider(options PluginProviderOptions) (*PluginProvider, error) {
 	if err := validateWatchSyncConnectionConfigSchemas(options.ConnectionConfigSchema); err != nil {
 		return nil, fmt.Errorf("watch sync plugin %q %w", options.ProviderKey, err)
 	}
+	if authMethod != AuthMethodAPIKey && hasWatchSyncConnectionConfigSchema(options.ConnectionConfigSchema) {
+		return nil, fmt.Errorf("watch sync plugin %q connection config requires API-key authentication", options.ProviderKey)
+	}
 	if options.ResolveClient == nil {
 		return nil, fmt.Errorf("watch sync plugin client resolver is required")
 	}
@@ -105,6 +108,15 @@ func NewPluginProvider(options PluginProviderOptions) (*PluginProvider, error) {
 		resolveConfig:          options.ResolveConfig,
 		repository:             options.Repository,
 	}, nil
+}
+
+func hasWatchSyncConnectionConfigSchema(schemas []*pluginv1.ConfigSchema) bool {
+	for _, schema := range schemas {
+		if schema != nil {
+			return true
+		}
+	}
+	return false
 }
 
 func (p *PluginProvider) Key() string { return p.providerKey }
