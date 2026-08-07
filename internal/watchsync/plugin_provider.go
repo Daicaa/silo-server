@@ -70,6 +70,7 @@ const (
 	watchSyncUnsupportedEpisodeMediaMessage = "watch sync plugin does not support episode media"
 	watchSyncUnsupportedMediaMessage        = "watch sync plugin does not support this media type"
 	watchSyncJSONSchemaNumberType           = "number"
+	watchSyncJSONSchemaBooleanType          = "boolean"
 )
 
 func NewPluginProvider(options PluginProviderOptions) (*PluginProvider, error) {
@@ -597,6 +598,7 @@ func (p *PluginProvider) connectionConfig(values ConnectionConfigValues) (*plugi
 		Values:       make(map[string]string),
 		SecretValues: make(map[string]string),
 	}
+	flattenedFields := make(map[string]string)
 	for _, schema := range p.connectionConfigSchema {
 		if schema == nil || strings.TrimSpace(schema.GetKey()) == "" {
 			continue
@@ -620,6 +622,7 @@ func (p *PluginProvider) connectionConfig(values ConnectionConfigValues) (*plugi
 			publicFields[field] = struct{}{}
 		}
 		for field, raw := range value {
+			rawField := field
 			field = strings.TrimSpace(field)
 			if field == "" {
 				continue
@@ -632,6 +635,14 @@ func (p *PluginProvider) connectionConfig(values ConnectionConfigValues) (*plugi
 				)
 			}
 			key := schema.GetKey() + "." + field
+			source := fmt.Sprintf("config %q field %q", schema.GetKey(), rawField)
+			if previous, exists := flattenedFields[key]; exists {
+				return nil, nil, sanitizedConnectionConfigError(
+					fmt.Errorf("watch sync connection %s conflicts with %s after flattening to %q", source, previous, key),
+					secrets,
+				)
+			}
+			flattenedFields[key] = source
 			if _, public := publicFields[field]; public {
 				result.Values[key] = encoded
 			} else {
@@ -730,6 +741,17 @@ func validateWatchSyncConnectionConfigSchemas(schemas []*pluginv1.ConfigSchema) 
 					field.GetKey(),
 				)
 			}
+			if field.GetControl() == pluginv1.AdminFormControl_ADMIN_FORM_CONTROL_SELECT {
+				for _, option := range field.GetOptions() {
+					if option != nil && strings.TrimSpace(option.GetValue()) == "" {
+						return fmt.Errorf(
+							"connection config %q field %q has a blank select option value",
+							schema.GetKey(),
+							field.GetKey(),
+						)
+					}
+				}
+			}
 			if pattern := field.GetValidation().GetPattern(); pattern != "" {
 				if _, err := regexp.Compile(pattern); err != nil {
 					return fmt.Errorf(
@@ -778,12 +800,21 @@ func validateConnectionSchemaIsRenderable(schema *pluginv1.ConfigSchema) error {
 	for key, property := range document.Properties {
 		field := explicit[key]
 		switch property.Type {
-		case "string", watchSyncJSONSchemaNumberType, "integer", "boolean":
+		case "string", watchSyncJSONSchemaNumberType, "integer", watchSyncJSONSchemaBooleanType:
+			if field != nil && !connectionAdminFieldSupportsScalarType(field, property.Type) {
+				return fmt.Errorf(
+					"connection config %q field %q control %q cannot emit json_schema type %q",
+					schema.GetKey(),
+					key,
+					field.GetControl().String(),
+					property.Type,
+				)
+			}
 			continue
 		case "array":
 			if field != nil && field.GetControl() == pluginv1.AdminFormControl_ADMIN_FORM_CONTROL_MULTI_SELECT &&
 				(property.Items == nil || property.Items.Type == "string" || property.Items.Type == watchSyncJSONSchemaNumberType ||
-					property.Items.Type == "integer" || property.Items.Type == "boolean") {
+					property.Items.Type == "integer" || property.Items.Type == watchSyncJSONSchemaBooleanType) {
 				continue
 			}
 		default:
@@ -803,6 +834,17 @@ func validateConnectionSchemaIsRenderable(schema *pluginv1.ConfigSchema) error {
 		)
 	}
 	return nil
+}
+
+func connectionAdminFieldSupportsScalarType(field *pluginv1.AdminFormField, propertyType string) bool {
+	switch field.GetControl() {
+	case pluginv1.AdminFormControl_ADMIN_FORM_CONTROL_SWITCH:
+		return propertyType == watchSyncJSONSchemaBooleanType
+	case pluginv1.AdminFormControl_ADMIN_FORM_CONTROL_MULTI_SELECT:
+		return false
+	default:
+		return true
+	}
 }
 
 func connectionAdminFieldRendersValue(field *pluginv1.AdminFormField) bool {
@@ -828,11 +870,17 @@ func validateConnectionAdminFormValue(schema *pluginv1.ConfigSchema, value map[s
 		return nil
 	}
 	for _, field := range schema.GetAdminForm().GetFields() {
-		if field == nil || field.GetValidation() == nil {
+		if field == nil || !connectionAdminFieldIsVisible(schema.GetAdminForm(), field, value) {
 			continue
 		}
 		raw, exists := value[field.GetKey()]
-		if !exists || raw == nil {
+		if !exists || connectionConfigValueIsEmpty(raw) {
+			if field.GetRequired() {
+				return fmt.Errorf("connection config %q field %q is required", schema.GetKey(), field.GetKey())
+			}
+			continue
+		}
+		if field.GetValidation() == nil {
 			continue
 		}
 		validation := field.GetValidation()
@@ -864,6 +912,89 @@ func validateConnectionAdminFormValue(schema *pluginv1.ConfigSchema, value map[s
 		}
 	}
 	return nil
+}
+
+func connectionConfigValueIsEmpty(value any) bool {
+	switch typed := value.(type) {
+	case nil:
+		return true
+	case string:
+		return strings.TrimSpace(typed) == ""
+	case []any:
+		return len(typed) == 0
+	default:
+		return false
+	}
+}
+
+func connectionAdminFieldIsVisible(
+	form *pluginv1.AdminFormDescriptor,
+	field *pluginv1.AdminFormField,
+	values map[string]any,
+) bool {
+	if !connectionAdminConditionsMatch(field.GetShowWhen(), values, form.GetFields()) {
+		return false
+	}
+	contained := false
+	for _, section := range form.GetSections() {
+		if section == nil || !stringSliceContains(section.GetFieldKeys(), field.GetKey()) {
+			continue
+		}
+		contained = true
+		if connectionAdminConditionsMatch(section.GetShowWhen(), values, form.GetFields()) {
+			return true
+		}
+	}
+	return !contained
+}
+
+func connectionAdminConditionsMatch(
+	conditions []*pluginv1.AdminFormCondition,
+	values map[string]any,
+	fields []*pluginv1.AdminFormField,
+) bool {
+	for _, condition := range conditions {
+		if condition == nil {
+			continue
+		}
+		value, exists := values[condition.GetField()]
+		if !exists {
+			for _, field := range fields {
+				if field != nil && field.GetKey() == condition.GetField() && field.GetDefaultValue() != nil {
+					value = field.GetDefaultValue().AsInterface()
+					break
+				}
+			}
+		}
+		if !stringSliceContains(condition.GetEquals(), connectionAdminConditionString(value)) {
+			return false
+		}
+	}
+	return true
+}
+
+func connectionAdminConditionString(value any) string {
+	switch typed := value.(type) {
+	case nil:
+		return ""
+	case bool:
+		return strconv.FormatBool(typed)
+	case float64:
+		return strconv.FormatFloat(typed, 'f', -1, 64)
+	case string:
+		return typed
+	default:
+		return fmt.Sprint(typed)
+	}
+}
+
+func stringSliceContains(values []string, target string) bool {
+	for _, value := range values {
+		if value == target {
+			return true
+		}
+	}
+	return false
 }
 
 func connectionConfigNumber(value any) (float64, bool) {

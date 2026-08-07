@@ -357,6 +357,29 @@ func TestPluginProviderRejectsUnresolvableDynamicConnectionOptions(t *testing.T)
 	}
 }
 
+func TestPluginProviderRejectsBlankConnectionSelectOption(t *testing.T) {
+	_, err := NewPluginProvider(PluginProviderOptions{
+		InstallationID: 4, ProviderKey: testPluginProviderKey, CapabilityID: testPluginCapabilityID,
+		Descriptor: &pluginv1.WatchSyncProviderDescriptor{AuthMethods: []pluginv1.WatchSyncAuthMethod{
+			pluginv1.WatchSyncAuthMethod_WATCH_SYNC_AUTH_METHOD_API_KEY,
+		}},
+		ConnectionConfigSchema: []*pluginv1.ConfigSchema{{
+			Key:        "server",
+			JsonSchema: `{"type":"object","properties":{"mode":{"type":"string"}}}`,
+			AdminForm: &pluginv1.AdminFormDescriptor{Fields: []*pluginv1.AdminFormField{{
+				Key: "mode", Control: pluginv1.AdminFormControl_ADMIN_FORM_CONTROL_SELECT,
+				Options: []*pluginv1.AdminFormOption{{Value: " ", Label: "Choose a mode"}},
+			}}},
+		}},
+		ResolveClient: func(context.Context, int, string) (WatchSyncPluginClient, error) {
+			return &fakeWatchSyncPluginClient{}, nil
+		},
+	})
+	if err == nil || !strings.Contains(err.Error(), "blank select option value") {
+		t.Fatalf("error = %v", err)
+	}
+}
+
 func TestPluginProviderRejectsDuplicateConnectionConfigKeys(t *testing.T) {
 	_, err := NewPluginProvider(PluginProviderOptions{
 		InstallationID: 4, ProviderKey: testPluginProviderKey, CapabilityID: testPluginCapabilityID,
@@ -501,6 +524,100 @@ func TestPluginProviderAcceptsRenderableRequiredConnectionConfig(t *testing.T) {
 	})
 	if err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestPluginProviderRejectsConnectionControlThatCannotEmitSchemaType(t *testing.T) {
+	_, err := NewPluginProvider(PluginProviderOptions{
+		InstallationID: 4, ProviderKey: testPluginProviderKey, CapabilityID: testPluginCapabilityID,
+		Descriptor: &pluginv1.WatchSyncProviderDescriptor{AuthMethods: []pluginv1.WatchSyncAuthMethod{
+			pluginv1.WatchSyncAuthMethod_WATCH_SYNC_AUTH_METHOD_API_KEY,
+		}},
+		ConnectionConfigSchema: []*pluginv1.ConfigSchema{{
+			Key:        "server",
+			JsonSchema: `{"type":"object","properties":{"name":{"type":"string"}}}`,
+			AdminForm: &pluginv1.AdminFormDescriptor{Fields: []*pluginv1.AdminFormField{{
+				Key: "name", Control: pluginv1.AdminFormControl_ADMIN_FORM_CONTROL_SWITCH,
+			}}},
+		}},
+		ResolveClient: func(context.Context, int, string) (WatchSyncPluginClient, error) {
+			return &fakeWatchSyncPluginClient{}, nil
+		},
+	})
+	if err == nil || !strings.Contains(err.Error(), "cannot emit json_schema type") {
+		t.Fatalf("error = %v", err)
+	}
+}
+
+func TestPluginProviderEnforcesVisibleRequiredConnectionAdminFields(t *testing.T) {
+	client := &fakeWatchSyncPluginClient{exchangeResponse: &pluginv1.WatchSyncCredentialResponse{
+		Credentials: &pluginv1.WatchSyncCredentials{AccessToken: testValidatedToken},
+		Account:     &pluginv1.WatchSyncAccount{ExternalSubject: "7"},
+	}}
+	provider, err := NewPluginProvider(PluginProviderOptions{
+		InstallationID: 4, ProviderKey: testPluginProviderKey, CapabilityID: testPluginCapabilityID,
+		Descriptor: &pluginv1.WatchSyncProviderDescriptor{AuthMethods: []pluginv1.WatchSyncAuthMethod{
+			pluginv1.WatchSyncAuthMethod_WATCH_SYNC_AUTH_METHOD_API_KEY,
+		}},
+		ConnectionConfigSchema: []*pluginv1.ConfigSchema{{
+			Key:        "server",
+			JsonSchema: `{"type":"object","properties":{"advanced":{"type":"boolean"},"endpoint":{"type":"string"}},"required":["advanced"],"additionalProperties":false}`,
+			AdminForm: &pluginv1.AdminFormDescriptor{Fields: []*pluginv1.AdminFormField{
+				{Key: "advanced", Control: pluginv1.AdminFormControl_ADMIN_FORM_CONTROL_SWITCH},
+				{
+					Key: "endpoint", Control: pluginv1.AdminFormControl_ADMIN_FORM_CONTROL_TEXT, Required: true,
+					ShowWhen: []*pluginv1.AdminFormCondition{{Field: "advanced", Equals: []string{"true"}}},
+				},
+			}},
+		}},
+		ResolveClient: func(context.Context, int, string) (WatchSyncPluginClient, error) {
+			return client, nil
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if _, _, err := provider.ConnectWithAPIKeyConfig(context.Background(), "token", ConnectionConfigValues{
+		"server": {"advanced": false},
+	}); err != nil {
+		t.Fatalf("hidden required field: %v", err)
+	}
+	if _, _, err := provider.ConnectWithAPIKeyConfig(context.Background(), "token", ConnectionConfigValues{
+		"server": {"advanced": true},
+	}); err == nil || !strings.Contains(err.Error(), `field "endpoint" is required`) {
+		t.Fatalf("visible required field error = %v", err)
+	}
+}
+
+func TestPluginProviderRejectsFlattenedConnectionConfigCollision(t *testing.T) {
+	client := &fakeWatchSyncPluginClient{}
+	provider, err := NewPluginProvider(PluginProviderOptions{
+		InstallationID: 4, ProviderKey: testPluginProviderKey, CapabilityID: testPluginCapabilityID,
+		Descriptor: &pluginv1.WatchSyncProviderDescriptor{AuthMethods: []pluginv1.WatchSyncAuthMethod{
+			pluginv1.WatchSyncAuthMethod_WATCH_SYNC_AUTH_METHOD_API_KEY,
+		}},
+		ConnectionConfigSchema: []*pluginv1.ConfigSchema{
+			{Key: "a", JsonSchema: `{"type":"object","properties":{"b.c":{"type":"string"}},"additionalProperties":false}`},
+			{Key: "a.b", JsonSchema: `{"type":"object","properties":{"c":{"type":"string"}},"additionalProperties":false}`},
+		},
+		ResolveClient: func(context.Context, int, string) (WatchSyncPluginClient, error) {
+			return client, nil
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	_, _, err = provider.ConnectWithAPIKeyConfig(context.Background(), "token", ConnectionConfigValues{
+		"a":   {"b.c": "first"},
+		"a.b": {"c": "second"},
+	})
+	if err == nil || !strings.Contains(err.Error(), "conflicts") || !strings.Contains(err.Error(), "after flattening") {
+		t.Fatalf("error = %v", err)
+	}
+	if client.exchangeRequest != nil {
+		t.Fatal("ambiguous connection config reached the plugin")
 	}
 }
 
