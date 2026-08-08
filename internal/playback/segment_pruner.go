@@ -40,18 +40,19 @@ func (s *TranscodeSession) scheduleSegmentPruneLocked() {
 // stuck behind startupFilesReady after cleanup begins.
 func (s *TranscodeSession) pruneDownloadedSegments(generation uint64, floor int) {
 	started := time.Now()
+	s.mu.Lock()
+	opts := s.opts
+	s.mu.Unlock()
+
 	entries, err := os.ReadDir(s.outputDir)
 	if err != nil {
 		s.finishSegmentPrune(generation, floor)
 		if !errors.Is(err, os.ErrNotExist) {
-			slog.Warn("read transcode segments for pruning", "component", "playback", "error", err, "session", s.opts.SessionID, "playback_session_id", s.opts.SessionID)
+			slog.Warn("read transcode segments for pruning", "component", "playback", "error", err, "session", opts.SessionID, "playback_session_id", opts.SessionID)
 		}
 		return
 	}
 
-	s.mu.Lock()
-	opts := s.opts
-	s.mu.Unlock()
 	segmentDuration := opts.SegmentDuration
 	if segmentDuration <= 0 {
 		segmentDuration = defaultSegmentDuration
