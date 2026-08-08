@@ -3819,9 +3819,7 @@ func (h *PlaybackHandler) HandleGetTranscodeSegment(w http.ResponseWriter, r *ht
 	sw := httpstream.NewRollingDeadlineWriter(w)
 	http.ServeContent(sw, r, segmentInfo.Name(), segmentInfo.ModTime(), segmentFile)
 	if r.Method == http.MethodGet &&
-		sw.StatusCode() == http.StatusOK &&
-		sw.BytesWritten() == segmentInfo.Size() &&
-		sw.Outcome(r.Context()) == httpstream.OutcomeCompleted {
+		sw.CompletedFullResponse(r.Context(), segmentInfo.Size()) {
 		if segNum, parseErr := playback.ParseSegmentNumber(segmentName); parseErr == nil {
 			transcodeSession.ReportSegmentDownloadedForGeneration(segNum, downloadGeneration)
 		}

@@ -1762,6 +1762,24 @@ func (s *TranscodeSession) cleanStaleSegments(startSegment int) {
 	}
 }
 
+// cleanSkippedSegments removes media that a forward seek jumped past. The
+// prior back buffer cannot remain eligible for the normal pruner after the
+// process start number advances, so leaving it in place would accumulate one
+// abandoned retention window per forward seek. Open response descriptors keep
+// any in-flight transfer valid after the directory entries are unlinked.
+func (s *TranscodeSession) cleanSkippedSegments(startSegment int) {
+	entries, err := os.ReadDir(s.outputDir)
+	if err != nil {
+		return
+	}
+	for _, entry := range entries {
+		segNum, parseErr := ParseSegmentNumber(entry.Name())
+		if parseErr == nil && segNum < startSegment {
+			_ = os.Remove(filepath.Join(s.outputDir, entry.Name()))
+		}
+	}
+}
+
 // Restart kills the current ffmpeg process and starts a new one seeking to
 // the given position. startSegment sets -hls_segment_start_number so that
 // output filenames align with the expected segment numbering. Existing
@@ -1803,6 +1821,7 @@ func (s *TranscodeSession) restart(
 	s.restarting = true
 	s.segmentGeneration++
 	s.segmentPruneRunning = false
+	previousRequestedSegment := s.lastRequestedSegment
 	s.lastRequestedSegment = startSegment
 	s.lastPruneFloor = startSegment - 1
 	cancelCurrent := s.cancel
@@ -1828,6 +1847,10 @@ func (s *TranscodeSession) restart(
 	opts := s.opts
 	reserveHWDevice := s.reserveHWDeviceOnRestart
 	s.mu.Unlock()
+
+	if startSegment > previousRequestedSegment {
+		s.cleanSkippedSegments(startSegment)
+	}
 
 	// Copy-mode restarts must clean stale segments so ffmpeg writes fresh
 	// output. Encoded transcodes keep old segments for backward seek reuse.
