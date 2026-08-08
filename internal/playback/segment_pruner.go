@@ -8,7 +8,11 @@ import (
 	"time"
 )
 
-const segmentPruneHysteresis = 5
+const (
+	segmentPruneHysteresis = 5
+	segmentPruneBatchSize  = 512
+	segmentPruneRetryDelay = 5 * time.Second
+)
 
 // scheduleSegmentPruneLocked starts one asynchronous prune pass after the
 // client has advanced far enough to make useful work. The caller must hold
@@ -35,55 +39,79 @@ func (s *TranscodeSession) scheduleSegmentPruneLocked() {
 }
 
 // pruneDownloadedSegments removes completed media files strictly behind floor.
-// FFmpeg's manifest and init files are never candidates, and the current
-// process's startup window remains present so real-manifest reloads cannot get
-// stuck behind startupFilesReady after cleanup begins.
+// It visits each newly expired segment number at most once in bounded batches,
+// avoiding repeated full-directory scans when FFmpeg has generated far ahead
+// of the client. The current process's startup window remains present so real
+// manifest reloads cannot get stuck behind startupFilesReady after cleanup.
 func (s *TranscodeSession) pruneDownloadedSegments(generation uint64, floor int) {
 	started := time.Now()
 	s.mu.Lock()
-	opts := s.opts
-	s.mu.Unlock()
-
-	entries, err := os.ReadDir(s.outputDir)
-	if err != nil {
-		s.finishSegmentPrune(generation, floor)
-		if !errors.Is(err, os.ErrNotExist) {
-			slog.Warn("read transcode segments for pruning", "component", "playback", "error", err, "session", opts.SessionID, "playback_session_id", opts.SessionID)
-		}
+	if generation != s.segmentGeneration || s.restarting {
+		s.mu.Unlock()
 		return
 	}
+	opts := s.opts
+	outputDir := s.outputDir
+	fromFloor := s.lastPruneFloor
+	s.mu.Unlock()
 
 	segmentDuration := opts.SegmentDuration
 	if segmentDuration <= 0 {
 		segmentDuration = defaultSegmentDuration
 	}
-	freshAfter := time.Now().Add(-(2*time.Duration(segmentDuration)*time.Second + 30*time.Second))
+	freshGuard := 2*time.Duration(segmentDuration)*time.Second + 30*time.Second
 	startupEnd := opts.StartSegmentNumber + startupSegmentRequirement(opts)
+	fromSegment := max(fromFloor, startupEnd)
+	toSegment := min(floor, fromSegment+segmentPruneBatchSize)
+	if fromSegment >= toSegment {
+		s.finishSegmentPrune(generation, floor, floor, 0)
+		return
+	}
 
+	if _, err := os.Stat(outputDir); err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			s.finishSegmentPrune(generation, toSegment, floor, 0)
+			return
+		}
+		slog.Warn("stat transcode directory for pruning", "component", "playback", "error", err, "session", opts.SessionID, "playback_session_id", opts.SessionID)
+		s.finishSegmentPrune(generation, fromSegment, floor, segmentPruneRetryDelay)
+		return
+	}
+
+	processedFloor := toSegment
+	var retryAfter time.Duration
 	removed := 0
 	var freedBytes int64
-	for _, entry := range entries {
-		segment, parseErr := ParseSegmentNumber(entry.Name())
-		if parseErr != nil || segment >= floor || (segment >= opts.StartSegmentNumber && segment < startupEnd) {
+	for segment := fromSegment; segment < toSegment; segment++ {
+		path := filepath.Join(outputDir, segmentFilename(segment, opts))
+		info, err := os.Stat(path)
+		if err != nil {
+			if errors.Is(err, os.ErrNotExist) {
+				continue
+			}
+			processedFloor, retryAfter = earlierPruneRetry(processedFloor, retryAfter, segment, segmentPruneRetryDelay)
+			slog.Warn("stat downloaded transcode segment", "component", "playback", "error", err, "segment", segment, "session", opts.SessionID, "playback_session_id", opts.SessionID)
 			continue
 		}
-		info, infoErr := entry.Info()
-		if infoErr != nil || info.ModTime().After(freshAfter) {
+		freshUntil := info.ModTime().Add(freshGuard)
+		if delay := time.Until(freshUntil); delay > 0 {
+			processedFloor, retryAfter = earlierPruneRetry(processedFloor, retryAfter, segment, delay)
 			continue
 		}
 
-		// Serialize the unlink with restart's generation change. Once restart
-		// advances the generation, this pass cannot delete newly generated files.
+		// Serialize the unlink with restart and shutdown generation changes.
+		// Once either advances the generation, this pass cannot delete files
+		// generated for a replacement timeline or session object.
 		s.mu.Lock()
 		if generation != s.segmentGeneration || s.restarting {
 			s.mu.Unlock()
-			s.finishSegmentPrune(generation, floor)
 			return
 		}
-		removeErr := os.Remove(filepath.Join(s.outputDir, entry.Name()))
+		removeErr := os.Remove(path)
 		s.mu.Unlock()
 		if removeErr != nil {
 			if !errors.Is(removeErr, os.ErrNotExist) {
+				processedFloor, retryAfter = earlierPruneRetry(processedFloor, retryAfter, segment, segmentPruneRetryDelay)
 				slog.Warn("remove downloaded transcode segment", "component", "playback", "error", removeErr, "segment", segment, "session", opts.SessionID, "playback_session_id", opts.SessionID)
 			}
 			continue
@@ -92,13 +120,13 @@ func (s *TranscodeSession) pruneDownloadedSegments(generation uint64, floor int)
 		freedBytes += info.Size()
 	}
 
-	s.finishSegmentPrune(generation, floor)
+	s.finishSegmentPrune(generation, processedFloor, floor, retryAfter)
 	if removed > 0 {
 		slog.Info("pruned downloaded transcode segments",
 			"component", "playback",
 			"count", removed,
 			"freed_bytes", freedBytes,
-			"floor_segment", floor,
+			"floor_segment", processedFloor,
 			"duration_ms", time.Since(started).Milliseconds(),
 			"session", opts.SessionID,
 			"playback_session_id", opts.SessionID,
@@ -106,14 +134,33 @@ func (s *TranscodeSession) pruneDownloadedSegments(generation uint64, floor int)
 	}
 }
 
-func (s *TranscodeSession) finishSegmentPrune(generation uint64, floor int) {
+func earlierPruneRetry(currentFloor int, currentDelay time.Duration, segment int, delay time.Duration) (int, time.Duration) {
+	if segment < currentFloor {
+		return segment, max(delay, time.Millisecond)
+	}
+	return currentFloor, currentDelay
+}
+
+func (s *TranscodeSession) finishSegmentPrune(generation uint64, processedFloor, targetFloor int, retryAfter time.Duration) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if generation != s.segmentGeneration {
 		return
 	}
-	if floor > s.lastPruneFloor {
-		s.lastPruneFloor = floor
+	if processedFloor > s.lastPruneFloor {
+		s.lastPruneFloor = processedFloor
+	}
+	if retryAfter > 0 {
+		time.AfterFunc(retryAfter, func() {
+			s.mu.Lock()
+			if generation != s.segmentGeneration || s.restarting {
+				s.mu.Unlock()
+				return
+			}
+			s.mu.Unlock()
+			go s.pruneDownloadedSegments(generation, targetFloor)
+		})
+		return
 	}
 	s.segmentPruneRunning = false
 	s.scheduleSegmentPruneLocked()

@@ -1684,6 +1684,8 @@ func (s *TranscodeSession) shutdown(removeOutput bool) error {
 	defer s.mu.Unlock()
 
 	s.running = false
+	s.segmentGeneration++
+	s.segmentPruneRunning = false
 
 	// Clean up temporary directory.
 	if removeOutput && s.outputDir != "" {

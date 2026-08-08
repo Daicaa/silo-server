@@ -33,7 +33,13 @@ func TestReportSegmentDownloadedPrunesOnlyExpiredBackBuffer(t *testing.T) {
 		lastRequestedSegment: 0,
 	}
 	session.ReportSegmentDownloaded(15)
-	waitForPrunePass(t, session)
+	waitForPrunerFileMissing(t, filepath.Join(dir, segmentFilename(9, TranscodeOpts{})))
+	t.Cleanup(func() {
+		session.mu.Lock()
+		session.segmentGeneration++
+		session.segmentPruneRunning = false
+		session.mu.Unlock()
+	})
 
 	for _, segment := range []int{0, 1, 2, 4, 10, 11, 12, 13, 14, 15} {
 		assertPrunerFileExists(t, filepath.Join(dir, segmentFilename(segment, TranscodeOpts{})))
@@ -43,6 +49,55 @@ func TestReportSegmentDownloadedPrunesOnlyExpiredBackBuffer(t *testing.T) {
 	}
 	for _, name := range []string{"init.mp4", "stream.m3u8", "seg_00004.ts.tmp", "notes.txt"} {
 		assertPrunerFileExists(t, filepath.Join(dir, name))
+	}
+}
+
+func TestFreshSegmentIsRetriedAfterGuardExpires(t *testing.T) {
+	dir := t.TempDir()
+	opts := TranscodeOpts{
+		SessionID:               "retry-test",
+		SegmentDuration:         2,
+		SegmentRetentionSeconds: 10,
+	}
+	guard := 2*time.Duration(opts.SegmentDuration)*time.Second + 30*time.Second
+	path := filepath.Join(dir, segmentFilename(3, opts))
+	writePrunerTestFile(t, path, []byte("segment"), time.Now().Add(-guard+100*time.Millisecond))
+	session := &TranscodeSession{
+		opts:                 opts,
+		outputDir:            dir,
+		lastPruneFloor:       -1,
+		lastRequestedSegment: 0,
+	}
+
+	session.ReportSegmentDownloaded(9)
+	waitForPrunerFileMissing(t, path)
+	waitForPrunePass(t, session, 4)
+}
+
+func TestPruningContinuesAcrossBoundedBatches(t *testing.T) {
+	dir := t.TempDir()
+	old := time.Now().Add(-time.Minute)
+	opts := TranscodeOpts{
+		SessionID:               "batch-test",
+		SegmentDuration:         2,
+		SegmentRetentionSeconds: 10,
+	}
+	for segment := 0; segment <= 600; segment++ {
+		writePrunerTestFile(t, filepath.Join(dir, segmentFilename(segment, opts)), []byte("segment"), old)
+	}
+	session := &TranscodeSession{
+		opts:                 opts,
+		outputDir:            dir,
+		lastPruneFloor:       -1,
+		lastRequestedSegment: 0,
+	}
+
+	session.ReportSegmentDownloaded(600)
+	waitForPrunerFileMissing(t, filepath.Join(dir, segmentFilename(594, opts)))
+	waitForPrunePass(t, session, 595)
+
+	for _, segment := range []int{0, 1, 2, 595, 600} {
+		assertPrunerFileExists(t, filepath.Join(dir, segmentFilename(segment, opts)))
 	}
 }
 
@@ -80,6 +135,23 @@ func TestOldGenerationDownloadDoesNotAdvanceRestartedSession(t *testing.T) {
 	}
 }
 
+func TestCloseInvalidatesInFlightSegmentGeneration(t *testing.T) {
+	session := &TranscodeSession{
+		opts:                 TranscodeOpts{SegmentRetentionSeconds: 600},
+		outputDir:            t.TempDir(),
+		lastRequestedSegment: 20,
+	}
+	downloadGeneration := session.SegmentGeneration()
+
+	if err := session.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	session.ReportSegmentDownloadedForGeneration(100, downloadGeneration)
+	if got := session.LastRequestedSegment(); got != 20 {
+		t.Fatalf("last requested segment = %d, want closed-session position 20", got)
+	}
+}
+
 func TestOpenSegmentDescriptorSurvivesUnlink(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "seg_00001.ts")
@@ -114,7 +186,7 @@ func writePrunerTestFile(t *testing.T, path string, contents []byte, modTime tim
 	}
 }
 
-func waitForPrunePass(t *testing.T, session *TranscodeSession) {
+func waitForPrunePass(t *testing.T, session *TranscodeSession, wantFloor int) {
 	t.Helper()
 	deadline := time.Now().Add(2 * time.Second)
 	for time.Now().Before(deadline) {
@@ -122,12 +194,24 @@ func waitForPrunePass(t *testing.T, session *TranscodeSession) {
 		running := session.segmentPruneRunning
 		floor := session.lastPruneFloor
 		session.mu.Unlock()
-		if !running && floor >= 10 {
+		if !running && floor >= wantFloor {
 			return
 		}
 		time.Sleep(5 * time.Millisecond)
 	}
 	t.Fatal("segment prune pass did not finish")
+}
+
+func waitForPrunerFileMissing(t *testing.T, path string) {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if _, err := os.Stat(path); os.IsNotExist(err) {
+			return
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	t.Fatalf("expected %s to be removed", filepath.Base(path))
 }
 
 func assertPrunerFileExists(t *testing.T, path string) {

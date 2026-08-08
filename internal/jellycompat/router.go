@@ -103,6 +103,13 @@ func NewRouter(deps Dependencies) chi.Router {
 	}
 	userDataHandler := NewUserDataHandler(deps.ContentService, deps.UserDataService, deps.IDCodec, deps.Config)
 	playbackHandler := NewPlaybackHandler(deps.Config, deps.ContentService, deps.IDCodec, deps.DeviceProfiles, deps.PlaybackStore, deps.SessionMgr, deps.FileResolver, deps.UserStoreProvider)
+	startupSegmentRetention := playbackHandler.SegmentRetentionSeconds
+	playbackHandler.SegmentRetentionSeconds = func() int {
+		if cfg := deps.CurrentConfig(); cfg != nil {
+			return cfg.Playback.SegmentRetentionSeconds
+		}
+		return startupSegmentRetention()
+	}
 	if deps.DB != nil {
 		playbackHandler.profileStaler = recommendations.NewRepo(deps.DB)
 	}

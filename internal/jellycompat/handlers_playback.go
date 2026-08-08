@@ -184,7 +184,7 @@ type PlaybackHandler struct {
 	FFmpegPath              string
 	HWAccel                 string
 	TranscodeDir            string
-	SegmentRetentionSeconds int
+	SegmentRetentionSeconds func() int
 	// tm is the shared transcode-session lifecycle (live map, reconstruct) — the
 	// same type the native handler uses, so jellycompat gets the reconstruct cap
 	// and node-affinity rule for free. The reconstruction recipe is carried in the
@@ -291,7 +291,7 @@ func NewPlaybackHandler(
 		FFmpegPath:              ffmpegPath,
 		HWAccel:                 hwAccel,
 		TranscodeDir:            transcodeDir,
-		SegmentRetentionSeconds: segmentRetentionSeconds,
+		SegmentRetentionSeconds: func() int { return segmentRetentionSeconds },
 		tm:                      playback.NewTranscodeManager(),
 	}
 	// Wire the shared transcode manager with closures so it reads the handler's
@@ -302,7 +302,7 @@ func NewPlaybackHandler(
 			TranscodeDir:            h.TranscodeDir,
 			FFmpegPath:              h.FFmpegPath,
 			HWAccel:                 h.HWAccel,
-			SegmentRetentionSeconds: h.SegmentRetentionSeconds,
+			SegmentRetentionSeconds: h.segmentRetentionSeconds(),
 		}
 	}
 	if reg, ok := sessionMgr.(interface {
@@ -340,6 +340,13 @@ func NewPlaybackHandler(
 		}
 	}
 	return h
+}
+
+func (h *PlaybackHandler) segmentRetentionSeconds() int {
+	if h.SegmentRetentionSeconds != nil {
+		return h.SegmentRetentionSeconds()
+	}
+	return 600
 }
 
 // CleanupOrphanedTranscodes removes stale per-session transcode dirs, sparing

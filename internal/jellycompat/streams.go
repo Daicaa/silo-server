@@ -1663,7 +1663,7 @@ func (h *PlaybackHandler) ensureTranscodeSession(ctx context.Context, playSessio
 		TotalDuration:      float64(source.Version.Duration),
 		FastStart:          true,
 	}
-	opts.SegmentRetentionSeconds = h.SegmentRetentionSeconds
+	opts.SegmentRetentionSeconds = h.segmentRetentionSeconds()
 	if source.TranscodeAudio {
 		opts.TargetCodecVideo = "copy"
 	}
