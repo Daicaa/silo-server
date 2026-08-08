@@ -20,10 +20,11 @@ import (
 // internal/playback does not import internal/config (avoiding an import cycle);
 // each embedding handler adapts its own config snapshot into this shape.
 type TranscodeRuntimeConfig struct {
-	TranscodeDir string
-	FFmpegPath   string
-	HWAccel      string
-	HWDevice     string
+	TranscodeDir            string
+	FFmpegPath              string
+	HWAccel                 string
+	HWDevice                string
+	SegmentRetentionSeconds int
 }
 
 // sessionReconstructor is the SessionManager capability used to re-register a
@@ -577,6 +578,7 @@ func (m *TranscodeManager) doReconstructTranscode(ctx context.Context, sessionID
 	// operator config change applies to reconstructed sessions too.
 	opts.HWAccel = cfg.HWAccel
 	opts.HWDevice = cfg.HWDevice
+	opts.SegmentRetentionSeconds = cfg.SegmentRetentionSeconds
 
 	// Resume near the segment the client is actually requesting. The card records
 	// the original start; if the client has played past it, spawning ffmpeg at the

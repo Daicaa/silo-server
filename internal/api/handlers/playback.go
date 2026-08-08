@@ -243,10 +243,11 @@ func NewPlaybackHandler(sessionMgr SessionManagerInterface, opts ...FilePathReso
 	h.tm.Config = func() playback.TranscodeRuntimeConfig {
 		c := h.playbackConfig()
 		return playback.TranscodeRuntimeConfig{
-			TranscodeDir: c.TranscodeDir,
-			FFmpegPath:   c.FFmpegPath,
-			HWAccel:      c.HWAccel,
-			HWDevice:     c.HWDevice,
+			TranscodeDir:            c.TranscodeDir,
+			FFmpegPath:              c.FFmpegPath,
+			HWAccel:                 c.HWAccel,
+			HWDevice:                c.HWDevice,
+			SegmentRetentionSeconds: c.SegmentRetentionSeconds,
 		}
 	}
 	h.tm.StartThrottler = func(ctx context.Context, ts *playback.TranscodeSession) {
@@ -322,8 +323,9 @@ func (h *PlaybackHandler) playbackConfig() config.PlaybackConfig {
 		return h.PlaybackConfig()
 	}
 	return config.PlaybackConfig{
-		TranscodeEnabled: true,
-		TranscodeDir:     filepath.Join(os.TempDir(), "silo-transcode"),
+		TranscodeEnabled:        true,
+		TranscodeDir:            filepath.Join(os.TempDir(), "silo-transcode"),
+		SegmentRetentionSeconds: 600,
 	}
 }
 
@@ -3446,32 +3448,33 @@ func (h *PlaybackHandler) HandleStartTranscode(w http.ResponseWriter, r *http.Re
 	}
 
 	localOpts := playback.TranscodeOpts{
-		InputPath:              file.FilePath,
-		OutputDir:              filepath.Join(playbackCfg.TranscodeDir, req.SessionID),
-		SessionID:              req.SessionID,
-		SourceVideoCodec:       file.CodecVideo,
-		VideoBitstreamFilter:   videoBitstreamFilter,
-		SeekSeconds:            transportSeekSeconds,
-		StreamOriginSeconds:    streamOriginSeconds,
-		CopySeekAnchorResolved: videoCopy,
-		StartSegmentNumber:     startSegmentNumber,
-		TargetResolution:       req.TargetResolution,
-		TargetCodecVideo:       req.TargetCodecVideo,
-		TargetCodecAudio:       req.TargetCodecAudio,
-		TargetBitrateKbps:      req.TargetBitrateKbps,
-		SegmentDuration:        req.SegmentDuration,
-		FFmpegPath:             playbackCfg.FFmpegPath,
-		HWAccel:                playbackCfg.HWAccel,
-		HWDevice:               playbackCfg.HWDevice,
-		AudioTrackIndex:        session.AudioTrackIndex,
-		SubtitleTrackIndex:     req.SubtitleTrackIndex,
-		SubtitleBurnIn:         req.SubtitleBurnIn,
-		SubtitleCodec:          subtitleCodec,
-		TotalDuration:          float64(file.Duration),
-		FastStart:              true,
-		NodeType:               "integrated",
-		ExecutionMode:          "integrated",
-		FFmpegLogSink:          h.FFmpegLogSink,
+		InputPath:               file.FilePath,
+		OutputDir:               filepath.Join(playbackCfg.TranscodeDir, req.SessionID),
+		SessionID:               req.SessionID,
+		SourceVideoCodec:        file.CodecVideo,
+		VideoBitstreamFilter:    videoBitstreamFilter,
+		SeekSeconds:             transportSeekSeconds,
+		StreamOriginSeconds:     streamOriginSeconds,
+		CopySeekAnchorResolved:  videoCopy,
+		StartSegmentNumber:      startSegmentNumber,
+		TargetResolution:        req.TargetResolution,
+		TargetCodecVideo:        req.TargetCodecVideo,
+		TargetCodecAudio:        req.TargetCodecAudio,
+		TargetBitrateKbps:       req.TargetBitrateKbps,
+		SegmentDuration:         req.SegmentDuration,
+		SegmentRetentionSeconds: playbackCfg.SegmentRetentionSeconds,
+		FFmpegPath:              playbackCfg.FFmpegPath,
+		HWAccel:                 playbackCfg.HWAccel,
+		HWDevice:                playbackCfg.HWDevice,
+		AudioTrackIndex:         session.AudioTrackIndex,
+		SubtitleTrackIndex:      req.SubtitleTrackIndex,
+		SubtitleBurnIn:          req.SubtitleBurnIn,
+		SubtitleCodec:           subtitleCodec,
+		TotalDuration:           float64(file.Duration),
+		FastStart:               true,
+		NodeType:                "integrated",
+		ExecutionMode:           "integrated",
+		FFmpegLogSink:           h.FFmpegLogSink,
 	}
 	startState := transcodeStartState{
 		req:            req,
@@ -3680,7 +3683,8 @@ func (h *PlaybackHandler) HandleGetTranscodeSegment(w http.ResponseWriter, r *ht
 	h.touchSessionActivity(sessionID)
 
 	segmentName := chi.URLParam(r, "name")
-	segmentPath, err := transcodeSession.GetSegment(segmentName)
+	downloadGeneration := transcodeSession.SegmentGeneration()
+	segmentFile, segmentInfo, err := transcodeSession.OpenSegment(segmentName)
 	if err != nil && errors.Is(err, playback.ErrSegmentNotFound) {
 		segNum, parseErr := playback.ParseSegmentNumber(segmentName)
 		if parseErr == nil {
@@ -3717,7 +3721,7 @@ func (h *PlaybackHandler) HandleGetTranscodeSegment(w http.ResponseWriter, r *ht
 					"session", sessionID,
 					"playback_session_id", sessionID,
 				)
-				segmentPath, err = transcodeSession.WaitForSegment(segmentName, decision.WaitTimeout)
+				segmentFile, segmentInfo, err = transcodeSession.WaitForOpenSegment(segmentName, decision.WaitTimeout)
 				if err != nil && errors.Is(err, playback.ErrSegmentNotFound) {
 					slog.InfoContext(r.Context(), "transcode segment wait timeout", "component", "api",
 						"segment", segmentName,
@@ -3779,7 +3783,7 @@ func (h *PlaybackHandler) HandleGetTranscodeSegment(w http.ResponseWriter, r *ht
 					); restartErr == nil {
 						// Throttler + exit monitor re-arm via the session's
 						// restart hook.
-						segmentPath, err = transcodeSession.WaitForSegment(segmentName, 30*time.Second)
+						segmentFile, segmentInfo, err = transcodeSession.WaitForOpenSegment(segmentName, 30*time.Second)
 						if err == nil && strings.EqualFold(transcodeSession.Opts().TargetCodecVideo, "copy") {
 							// Copy-mode seeks can resume as soon as the target segment
 							// exists, but that sometimes leaves the player one segment
@@ -3787,7 +3791,9 @@ func (h *PlaybackHandler) HandleGetTranscodeSegment(w http.ResponseWriter, r *ht
 							// for a single lookahead fragment when available so the
 							// first resumed playback window is less brittle.
 							nextSegmentName := fmt.Sprintf("seg_%05d.m4s", segNum+1)
-							_, _ = transcodeSession.WaitForSegment(nextSegmentName, 1200*time.Millisecond)
+							if nextSegment, _, nextErr := transcodeSession.WaitForOpenSegment(nextSegmentName, 1200*time.Millisecond); nextErr == nil {
+								_ = nextSegment.Close()
+							}
 						}
 					}
 				}
@@ -3795,7 +3801,7 @@ func (h *PlaybackHandler) HandleGetTranscodeSegment(w http.ResponseWriter, r *ht
 		} else if transcodeSession.IsRunning() {
 			// Non-numbered segment (e.g., init.mp4 for fMP4 HLS).
 			// Wait briefly — the init segment is written almost immediately.
-			segmentPath, err = transcodeSession.WaitForSegment(segmentName, 10*time.Second)
+			segmentFile, segmentInfo, err = transcodeSession.WaitForOpenSegment(segmentName, 10*time.Second)
 		}
 	}
 	if err != nil {
@@ -3807,14 +3813,19 @@ func (h *PlaybackHandler) HandleGetTranscodeSegment(w http.ResponseWriter, r *ht
 		return
 	}
 
-	// Report segment download for throttle tracking.
-	if segNum, parseErr := playback.ParseSegmentNumber(segmentName); parseErr == nil {
-		transcodeSession.ReportSegmentDownloaded(segNum)
-	}
-
 	w.Header().Set("Cache-Control", "no-store, max-age=0")
 	w.Header().Set("Pragma", "no-cache")
-	http.ServeFile(w, r, segmentPath)
+	defer func() { _ = segmentFile.Close() }()
+	sw := httpstream.NewRollingDeadlineWriter(w)
+	http.ServeContent(sw, r, segmentInfo.Name(), segmentInfo.ModTime(), segmentFile)
+	if r.Method == http.MethodGet &&
+		sw.StatusCode() == http.StatusOK &&
+		sw.BytesWritten() == segmentInfo.Size() &&
+		sw.Outcome(r.Context()) == httpstream.OutcomeCompleted {
+		if segNum, parseErr := playback.ParseSegmentNumber(segmentName); parseErr == nil {
+			transcodeSession.ReportSegmentDownloadedForGeneration(segNum, downloadGeneration)
+		}
+	}
 }
 
 // buildProxyManifestURL signs a stream token carrying the session's full

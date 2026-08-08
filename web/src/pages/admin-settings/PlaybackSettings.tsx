@@ -16,6 +16,7 @@ import {
 const KEYS = [
   "playback.ffmpeg_path",
   "playback.transcode_dir",
+  "playback.segment_retention_seconds",
   "playback.hw_accel",
   "playback.hw_device",
   "playback.transcode_enabled",
@@ -196,6 +197,13 @@ export default function PlaybackSettings() {
         </FieldGroup>
 
         <FieldGroup label="Segments">
+          <SettingField
+            label="Transcode Back Buffer (seconds)"
+            type="number"
+            hint="Keeps this much already-downloaded media for instant backward seeking, then reclaims older transcode segments. Use 0 to disable cleanup; enabled values must be at least 120 seconds. Pair with transcode throttling to bound both behind- and ahead-of-client disk usage."
+            value={form.getValue("playback.segment_retention_seconds")}
+            onChange={(v) => form.setValue("playback.segment_retention_seconds", v)}
+          />
           <SettingField
             label="Chapter Thumbnail Workers"
             type="number"

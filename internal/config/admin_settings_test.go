@@ -217,11 +217,26 @@ func TestNormalizeAdminSettingRejectsInvalidValues(t *testing.T) {
 		{key: "theme.catalog_url", value: "http://raw.githubusercontent.com/Silo-Server/silo-themes/main/catalog.json"},
 		{key: "theme.catalog_url", value: "https://example.com/catalog.json"},
 		{key: "redis.url", value: "not-a-url"},
+		{key: "playback.segment_retention_seconds", value: "119"},
 	}
 	for _, tc := range tests {
 		t.Run(tc.key, func(t *testing.T) {
 			if _, err := NormalizeAdminSetting(tc.key, tc.value); err == nil {
 				t.Fatalf("NormalizeAdminSetting(%q, %q) returned nil error", tc.key, tc.value)
+			}
+		})
+	}
+}
+
+func TestNormalizeAdminSettingAcceptsSegmentRetentionBounds(t *testing.T) {
+	for _, value := range []string{"0", "120", "86400"} {
+		t.Run(value, func(t *testing.T) {
+			got, err := NormalizeAdminSetting("playback.segment_retention_seconds", value)
+			if err != nil {
+				t.Fatalf("NormalizeAdminSetting: %v", err)
+			}
+			if got != value {
+				t.Fatalf("normalized retention = %q, want %q", got, value)
 			}
 		})
 	}

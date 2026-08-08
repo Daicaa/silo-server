@@ -184,6 +184,7 @@ type PlaybackHandler struct {
 	FFmpegPath              string
 	HWAccel                 string
 	TranscodeDir            string
+	SegmentRetentionSeconds int
 	// tm is the shared transcode-session lifecycle (live map, reconstruct) — the
 	// same type the native handler uses, so jellycompat gets the reconstruct cap
 	// and node-affinity rule for free. The reconstruction recipe is carried in the
@@ -268,36 +269,40 @@ func NewPlaybackHandler(
 	transcodeDir := filepath.Join(os.TempDir(), "silo-transcode")
 	ffmpegPath := ""
 	hwAccel := ""
+	segmentRetentionSeconds := 600
 	if cfg != nil {
 		if cfg.Playback.TranscodeDir != "" {
 			transcodeDir = cfg.Playback.TranscodeDir
 		}
 		ffmpegPath = cfg.Playback.FFmpegPath
 		hwAccel = cfg.Playback.HWAccel
+		segmentRetentionSeconds = cfg.Playback.SegmentRetentionSeconds
 	}
 
 	h := &PlaybackHandler{
-		cfg:            cfg,
-		content:        content,
-		codec:          codec,
-		deviceProfiles: deviceProfiles,
-		playbackStore:  playbackStore,
-		sessionMgr:     sessionMgr,
-		fileResolver:   fileResolver,
-		storeProvider:  storeProvider,
-		FFmpegPath:     ffmpegPath,
-		HWAccel:        hwAccel,
-		TranscodeDir:   transcodeDir,
-		tm:             playback.NewTranscodeManager(),
+		cfg:                     cfg,
+		content:                 content,
+		codec:                   codec,
+		deviceProfiles:          deviceProfiles,
+		playbackStore:           playbackStore,
+		sessionMgr:              sessionMgr,
+		fileResolver:            fileResolver,
+		storeProvider:           storeProvider,
+		FFmpegPath:              ffmpegPath,
+		HWAccel:                 hwAccel,
+		TranscodeDir:            transcodeDir,
+		SegmentRetentionSeconds: segmentRetentionSeconds,
+		tm:                      playback.NewTranscodeManager(),
 	}
 	// Wire the shared transcode manager with closures so it reads the handler's
 	// (late-set) JWTSecret lazily, matching the native handler.
 	h.tm.JWTSecretFn = func() string { return h.JWTSecret }
 	h.tm.Config = func() playback.TranscodeRuntimeConfig {
 		return playback.TranscodeRuntimeConfig{
-			TranscodeDir: h.TranscodeDir,
-			FFmpegPath:   h.FFmpegPath,
-			HWAccel:      h.HWAccel,
+			TranscodeDir:            h.TranscodeDir,
+			FFmpegPath:              h.FFmpegPath,
+			HWAccel:                 h.HWAccel,
+			SegmentRetentionSeconds: h.SegmentRetentionSeconds,
 		}
 	}
 	if reg, ok := sessionMgr.(interface {

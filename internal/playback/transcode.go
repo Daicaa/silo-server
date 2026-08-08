@@ -45,17 +45,18 @@ type TranscodeOpts struct {
 	StreamOriginSeconds float64
 	// CopySeekAnchorResolved distinguishes a valid zero-second origin from
 	// older/shared recipes that never resolved a copy seek anchor.
-	CopySeekAnchorResolved bool
-	TargetResolution       string // e.g., 1080p, 720p
-	TargetCodecVideo       string // e.g., h264 (or hevc if allowed)
-	TargetCodecAudio       string // e.g., aac
-	SegmentDuration        int    // seconds, default 6
-	StartSegmentNumber     int    // -hls_segment_start_number, default 0
-	FFmpegPath             string // optional explicit ffmpeg binary path
-	HWAccel                string // auto, qsv, vaapi, nvenc, none
-	HWDevice               string // e.g., /dev/dri/renderD128 (default if empty)
-	SubtitleTrackIndex     int    // -1 = no subtitles
-	SubtitleBurnIn         bool
+	CopySeekAnchorResolved  bool
+	TargetResolution        string // e.g., 1080p, 720p
+	TargetCodecVideo        string // e.g., h264 (or hevc if allowed)
+	TargetCodecAudio        string // e.g., aac
+	SegmentDuration         int    // seconds, default 6
+	SegmentRetentionSeconds int    // downloaded media retained behind the client; 0 disables pruning
+	StartSegmentNumber      int    // -hls_segment_start_number, default 0
+	FFmpegPath              string // optional explicit ffmpeg binary path
+	HWAccel                 string // auto, qsv, vaapi, nvenc, none
+	HWDevice                string // e.g., /dev/dri/renderD128 (default if empty)
+	SubtitleTrackIndex      int    // -1 = no subtitles
+	SubtitleBurnIn          bool
 	// SubtitleCodec is the probed codec of the burn-in track (e.g. "subrip",
 	// "hdmv_pgs_subtitle"). Bitmap codecs (PGS/DVD/DVB) select the overlay
 	// filter_complex pipeline; text codecs use the libass subtitles filter.
@@ -92,6 +93,9 @@ type TranscodeSession struct {
 	done                 chan struct{} // closed when the monitor goroutine finishes
 	stdinPipe            io.WriteCloser
 	lastRequestedSegment int
+	lastPruneFloor       int
+	segmentPruneRunning  bool
+	segmentGeneration    uint64
 	throttler            *TranscodeThrottler
 	stderrLinesLogged    int
 	stderrBytesLogged    int
@@ -202,6 +206,7 @@ func StartTranscode(ctx context.Context, opts TranscodeOpts) (*TranscodeSession,
 		done:                     make(chan struct{}),
 		stderr:                   newBoundedTailBuffer(stderrTailMaxBytes),
 		lastRequestedSegment:     opts.StartSegmentNumber,
+		lastPruneFloor:           opts.StartSegmentNumber - 1,
 		reserveHWDeviceOnRestart: reserveHWDeviceOnRestart,
 	}
 
@@ -1620,6 +1625,31 @@ func (s *TranscodeSession) GetSegment(name string) (string, error) {
 	return segPath, nil
 }
 
+// OpenSegment opens a completed segment for serving. Keeping the descriptor
+// open while the response is written makes it a filesystem-backed lease: a
+// concurrent prune may unlink the directory entry, but the response can still
+// read the complete file on POSIX filesystems.
+func (s *TranscodeSession) OpenSegment(name string) (*os.File, os.FileInfo, error) {
+	clean := filepath.Base(name)
+	segment, err := os.Open(filepath.Join(s.outputDir, clean))
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, nil, ErrSegmentNotFound
+		}
+		return nil, nil, fmt.Errorf("open segment: %w", err)
+	}
+	info, err := segment.Stat()
+	if err != nil {
+		_ = segment.Close()
+		return nil, nil, fmt.Errorf("stat segment: %w", err)
+	}
+	if info.Size() <= 0 {
+		_ = segment.Close()
+		return nil, nil, ErrSegmentNotFound
+	}
+	return segment, info, nil
+}
+
 // Close terminates the ffmpeg process and removes the temporary output directory.
 func (s *TranscodeSession) Close() error {
 	return s.shutdown(true)
@@ -1769,6 +1799,10 @@ func (s *TranscodeSession) restart(
 		return nil
 	}
 	s.restarting = true
+	s.segmentGeneration++
+	s.segmentPruneRunning = false
+	s.lastRequestedSegment = startSegment
+	s.lastPruneFloor = startSegment - 1
 	cancelCurrent := s.cancel
 	done := s.done
 	s.mu.Unlock()
@@ -1923,6 +1957,49 @@ func (s *TranscodeSession) WaitForSegment(name string, timeout time.Duration) (s
 		select {
 		case <-deadline:
 			return "", ErrSegmentNotFound
+		case <-time.After(100 * time.Millisecond):
+		}
+	}
+}
+
+// WaitForOpenSegment is the opened-file counterpart to WaitForSegment. It
+// closes the stat-to-open race for HTTP serving while preserving the same
+// restart and ffmpeg-exit error contract.
+func (s *TranscodeSession) WaitForOpenSegment(name string, timeout time.Duration) (*os.File, os.FileInfo, error) {
+	deadline := time.After(timeout)
+	for {
+		segment, info, err := s.OpenSegment(name)
+		if err == nil {
+			return segment, info, nil
+		}
+		if !errors.Is(err, ErrSegmentNotFound) {
+			return nil, nil, err
+		}
+
+		s.mu.Lock()
+		running := s.running
+		restarting := s.restarting
+		waitErr := s.waitErr
+		s.mu.Unlock()
+
+		if restarting {
+			select {
+			case <-deadline:
+				return nil, nil, ErrSegmentNotFound
+			case <-time.After(100 * time.Millisecond):
+				continue
+			}
+		}
+		if !running && waitErr != nil {
+			return nil, nil, fmt.Errorf("%w: %w", ErrTranscodeFailed, waitErr)
+		}
+		if !running {
+			return nil, nil, ErrSegmentNotFound
+		}
+
+		select {
+		case <-deadline:
+			return nil, nil, ErrSegmentNotFound
 		case <-time.After(100 * time.Millisecond):
 		}
 	}
@@ -2175,9 +2252,34 @@ func (s *TranscodeSession) RestartSeekTarget(segNum int) (float64, bool, error) 
 func (s *TranscodeSession) ReportSegmentDownloaded(segNum int) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	s.reportSegmentDownloadedLocked(segNum)
+}
+
+// SegmentGeneration identifies the current ffmpeg timeline. Callers that hold
+// an open segment across a restart use it to prevent the old response from
+// advancing the replacement process's download position.
+func (s *TranscodeSession) SegmentGeneration() uint64 {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.segmentGeneration
+}
+
+// ReportSegmentDownloadedForGeneration records completion only if the served
+// file belongs to the current ffmpeg timeline.
+func (s *TranscodeSession) ReportSegmentDownloadedForGeneration(segNum int, generation uint64) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if generation != s.segmentGeneration {
+		return
+	}
+	s.reportSegmentDownloadedLocked(segNum)
+}
+
+func (s *TranscodeSession) reportSegmentDownloadedLocked(segNum int) {
 	if segNum > s.lastRequestedSegment {
 		s.lastRequestedSegment = segNum
 	}
+	s.scheduleSegmentPruneLocked()
 }
 
 // LastRequestedSegment returns the highest segment number downloaded by the client.

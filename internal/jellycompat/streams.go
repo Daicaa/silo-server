@@ -21,6 +21,7 @@ import (
 
 	"github.com/go-chi/chi/v5"
 
+	"github.com/Silo-Server/silo-server/internal/httpstream"
 	"github.com/Silo-Server/silo-server/internal/models"
 	"github.com/Silo-Server/silo-server/internal/nodepool"
 	"github.com/Silo-Server/silo-server/internal/playback"
@@ -415,8 +416,9 @@ func (h *PlaybackHandler) HandleHLSSegment(w http.ResponseWriter, r *http.Reques
 		}
 	}
 
-	segmentFile := name + "." + ext
-	segmentPath, err := transcodeSession.GetSegment(segmentFile)
+	segmentName := name + "." + ext
+	downloadGeneration := transcodeSession.SegmentGeneration()
+	segment, segmentInfo, err := transcodeSession.OpenSegment(segmentName)
 	if err != nil && errors.Is(err, playback.ErrSegmentNotFound) {
 		segNum, parseErr := playback.ParseSegmentNumber(name)
 		if parseErr == nil {
@@ -427,7 +429,7 @@ func (h *PlaybackHandler) HandleHLSSegment(w http.ResponseWriter, r *http.Reques
 				lastProducedAgeMS = now.Sub(decision.Progress.LastProducedAt).Milliseconds()
 			}
 			slog.InfoContext(r.Context(), "transcode segment missing", "component", "jellycompat",
-				"segment", segmentFile,
+				"segment", segmentName,
 				"requested_segment", segNum,
 				"produced_head", decision.Progress.ProducedHead,
 				"last_requested_segment", decision.Progress.LastRequestedSegment,
@@ -441,7 +443,7 @@ func (h *PlaybackHandler) HandleHLSSegment(w http.ResponseWriter, r *http.Reques
 			)
 			if decision.Wait {
 				slog.InfoContext(r.Context(), "transcode segment wait", "component", "jellycompat",
-					"segment", segmentFile,
+					"segment", segmentName,
 					"requested_segment", segNum,
 					"produced_head", decision.Progress.ProducedHead,
 					"last_requested_segment", decision.Progress.LastRequestedSegment,
@@ -453,10 +455,10 @@ func (h *PlaybackHandler) HandleHLSSegment(w http.ResponseWriter, r *http.Reques
 					"session", playSession.UpstreamSessionID,
 					"playback_session_id", playSession.UpstreamSessionID,
 				)
-				segmentPath, err = transcodeSession.WaitForSegment(segmentFile, decision.WaitTimeout)
+				segment, segmentInfo, err = transcodeSession.WaitForOpenSegment(segmentName, decision.WaitTimeout)
 				if err != nil && errors.Is(err, playback.ErrSegmentNotFound) {
 					slog.InfoContext(r.Context(), "transcode segment wait timeout", "component", "jellycompat",
-						"segment", segmentFile,
+						"segment", segmentName,
 						"requested_segment", segNum,
 						"produced_head", decision.Progress.ProducedHead,
 						"last_requested_segment", decision.Progress.LastRequestedSegment,
@@ -476,7 +478,7 @@ func (h *PlaybackHandler) HandleHLSSegment(w http.ResponseWriter, r *http.Reques
 				if seekErr != nil && !errors.Is(seekErr, playback.ErrManifestNotReady) {
 					slog.ErrorContext(r.Context(), "resolve transcode seek target", "component", "jellycompat",
 						"error", seekErr,
-						"segment", segmentFile,
+						"segment", segmentName,
 						"play_session", playSessionID,
 						"session", playSession.UpstreamSessionID,
 						"playback_session_id", playSession.UpstreamSessionID,
@@ -495,7 +497,7 @@ func (h *PlaybackHandler) HandleHLSSegment(w http.ResponseWriter, r *http.Reques
 
 				if ok {
 					slog.InfoContext(r.Context(), "transcode seek restart", "component", "jellycompat",
-						"segment", segmentFile,
+						"segment", segmentName,
 						"requested_segment", segNum,
 						"produced_head", decision.Progress.ProducedHead,
 						"last_requested_segment", decision.Progress.LastRequestedSegment,
@@ -516,14 +518,14 @@ func (h *PlaybackHandler) HandleHLSSegment(w http.ResponseWriter, r *http.Reques
 						seekSeconds,
 						segNum,
 					); restartErr == nil {
-						segmentPath, err = transcodeSession.WaitForSegment(segmentFile, 30*time.Second)
+						segment, segmentInfo, err = transcodeSession.WaitForOpenSegment(segmentName, 30*time.Second)
 					}
 				}
 			}
 		} else if transcodeSession.IsRunning() {
 			// Non-numbered segment (e.g. init.mp4 for fMP4 HLS).
 			// Wait briefly — the init segment is written almost immediately.
-			segmentPath, err = transcodeSession.WaitForSegment(segmentFile, 10*time.Second)
+			segment, segmentInfo, err = transcodeSession.WaitForOpenSegment(segmentName, 10*time.Second)
 		}
 	}
 	if err != nil {
@@ -532,11 +534,17 @@ func (h *PlaybackHandler) HandleHLSSegment(w http.ResponseWriter, r *http.Reques
 		return
 	}
 
-	if segNum, parseErr := playback.ParseSegmentNumber(name); parseErr == nil {
-		transcodeSession.ReportSegmentDownloaded(segNum)
+	defer func() { _ = segment.Close() }()
+	sw := httpstream.NewRollingDeadlineWriter(w)
+	http.ServeContent(sw, r, segmentInfo.Name(), segmentInfo.ModTime(), segment)
+	if r.Method == http.MethodGet &&
+		sw.StatusCode() == http.StatusOK &&
+		sw.BytesWritten() == segmentInfo.Size() &&
+		sw.Outcome(r.Context()) == httpstream.OutcomeCompleted {
+		if segNum, parseErr := playback.ParseSegmentNumber(name); parseErr == nil {
+			transcodeSession.ReportSegmentDownloadedForGeneration(segNum, downloadGeneration)
+		}
 	}
-
-	http.ServeFile(w, r, segmentPath)
 }
 
 // hlsSegmentErrorResponse maps a segment-retrieval error to a Jellyfin-faithful
@@ -1655,6 +1663,7 @@ func (h *PlaybackHandler) ensureTranscodeSession(ctx context.Context, playSessio
 		TotalDuration:      float64(source.Version.Duration),
 		FastStart:          true,
 	}
+	opts.SegmentRetentionSeconds = h.SegmentRetentionSeconds
 	if source.TranscodeAudio {
 		opts.TargetCodecVideo = "copy"
 	}
