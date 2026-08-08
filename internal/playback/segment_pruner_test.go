@@ -61,7 +61,7 @@ func TestFreshSegmentIsRetriedAfterGuardExpires(t *testing.T) {
 	}
 	guard := 2*time.Duration(opts.SegmentDuration)*time.Second + 30*time.Second
 	path := filepath.Join(dir, segmentFilename(3, opts))
-	writePrunerTestFile(t, path, []byte("segment"), time.Now().Add(-guard+100*time.Millisecond))
+	writePrunerTestFile(t, path, []byte("segment"), time.Now().Add(-guard+time.Second))
 	session := &TranscodeSession{
 		opts:                 opts,
 		outputDir:            dir,
