@@ -99,7 +99,7 @@ type TranscodeOpts struct {
 const DV7ToHDR10BitstreamFilter = "dovi_rpu=strip=1"
 
 const (
-	transcodeCodecH264 = "h264"
+	transcodeCodecH264      = "h264"
 	transcodeHWQSV          = "qsv"
 	transcodeHWVAAPI        = "vaapi"
 	transcodeHWNVENC        = "nvenc"
