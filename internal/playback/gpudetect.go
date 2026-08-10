@@ -13,6 +13,8 @@ import (
 	"time"
 )
 
+const darwinGOOS = "darwin"
+
 var (
 	defaultDRIDir              = "/dev/dri"
 	defaultNVIDIAControlDevice = "/dev/nvidiactl"
@@ -106,15 +108,15 @@ func ResolveHWAccelWithFFmpeg(hwAccel string, ffmpegPath string) string {
 	if hwAccel != "auto" {
 		return hwAccel
 	}
-	if currentGOOS == "darwin" {
+	if currentGOOS == darwinGOOS {
 		if ok, reason := ffmpegSupportsVideoToolbox(ffmpegPath); ok {
 			slog.Info("hw_accel=auto: macOS detected, using VideoToolbox")
-			return "videotoolbox"
+			return transcodeHWVideoToolbox
 		} else {
 			slog.Warn("hw_accel=auto: macOS detected but FFmpeg VideoToolbox probe failed",
 				"ffmpeg", normalizeFFmpegPath(ffmpegPath), "reason", reason)
 		}
-		return "none"
+		return transcodeHWNone
 	}
 	if currentGOOS != "linux" {
 		return "none"
