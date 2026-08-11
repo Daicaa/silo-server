@@ -85,7 +85,11 @@ func Acknowledge(ctx context.Context, client *http.Client, targetURL, jwtSecret,
 	if client == nil {
 		client = http.DefaultClient
 	}
-	ackCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	// The downstream request is commonly canceled as soon as its response body
+	// reaches the client, while the handler is still issuing this acknowledgement.
+	// Preserve request-scoped values, but give the post-response hop its own
+	// bounded lifetime so a successful delivery is not mistaken for a disconnect.
+	ackCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
 	defer cancel()
 	req, err := http.NewRequestWithContext(ackCtx, http.MethodPost, targetURL+"/downloaded", nil)
 	if err != nil {
