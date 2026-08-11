@@ -202,7 +202,6 @@ func segmentRetentionFloor(outputDir string, opts TranscodeOpts, downloadedThrou
 		return 0, false, nil
 	}
 
-	floor = downloadedThrough
 	retainedSeconds := 0.0
 	for i := downloadedIndex - 1; i >= 0; i-- {
 		floor = timeline.entries[i].number
