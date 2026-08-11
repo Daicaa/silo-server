@@ -103,6 +103,39 @@ func TestPruningContinuesAcrossBoundedBatches(t *testing.T) {
 	}
 }
 
+func TestForwardRestartPrunesOnlyFilesPresentAcrossSparseGap(t *testing.T) {
+	dir := t.TempDir()
+	old := time.Now().Add(-time.Minute)
+	opts := TranscodeOpts{
+		SessionID:               "sparse-restart-test",
+		SegmentDuration:         2,
+		SegmentRetentionSeconds: 10,
+		StartSegmentNumber:      100_000,
+	}
+	for _, segment := range []int{3, 70, 99_999, 100_000} {
+		writePrunerTestFile(t, filepath.Join(dir, segmentFilename(segment, opts)), []byte("segment"), old)
+	}
+	writePrunerTestFile(t, filepath.Join(dir, "seg_00004.ts.tmp"), []byte("temporary"), old)
+	session := &TranscodeSession{
+		opts:                 opts,
+		outputDir:            dir,
+		lastPruneFloor:       -1,
+		lastRequestedSegment: opts.StartSegmentNumber,
+		lastCompletedSegment: opts.StartSegmentNumber - 1,
+		pruneBeforeStart:     true,
+	}
+
+	session.ReportSegmentDownloaded(opts.StartSegmentNumber + 5)
+	waitForPrunerFileMissing(t, filepath.Join(dir, segmentFilename(99_999, opts)))
+	waitForPrunePass(t, session, opts.StartSegmentNumber)
+
+	for _, segment := range []int{3, 70, 99_999} {
+		assertPrunerFileMissing(t, filepath.Join(dir, segmentFilename(segment, opts)))
+	}
+	assertPrunerFileExists(t, filepath.Join(dir, segmentFilename(100_000, opts)))
+	assertPrunerFileExists(t, filepath.Join(dir, "seg_00004.ts.tmp"))
+}
+
 func TestCopyRetentionUsesManifestDurations(t *testing.T) {
 	dir := t.TempDir()
 	old := time.Now().Add(-time.Minute)

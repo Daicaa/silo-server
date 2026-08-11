@@ -16,6 +16,11 @@ const (
 	segmentPruneRetryDelay = 5 * time.Second
 )
 
+type segmentPruneCandidate struct {
+	number int
+	path   string
+}
+
 // scheduleSegmentPruneLocked starts one asynchronous prune pass after the
 // client has advanced far enough to make useful work. The caller must hold
 // s.mu. Segment retention is measured in media time so custom HLS segment
@@ -96,44 +101,96 @@ func (s *TranscodeSession) pruneDownloadedSegments(generation uint64, downloaded
 		// A forward restart intentionally keeps the previous generation's back
 		// buffer until the replacement has produced its own. Retire that older
 		// range first, including its startup files, then resume normal pruning
-		// without touching the replacement process's startup window.
-		fromSegment = max(fromFloor, 0)
+		// without touching the replacement process's startup window. The old
+		// range can be very sparse after a long seek, so enumerate actual files
+		// below the new start rather than walking every intervening number.
 		targetFloor = min(floor, opts.StartSegmentNumber)
 	}
-	toSegment := min(targetFloor, fromSegment+segmentPruneBatchSize)
-	if fromSegment >= toSegment {
+	if !pruneBeforeStart && fromSegment >= targetFloor {
 		s.finishSegmentPrune(generation, targetFloor, targetFloor, downloadedThrough, 0)
 		return
 	}
 
 	if _, err := os.Stat(outputDir); err != nil {
 		if errors.Is(err, os.ErrNotExist) {
-			s.finishSegmentPrune(generation, toSegment, targetFloor, downloadedThrough, 0)
+			s.finishSegmentPrune(generation, targetFloor, targetFloor, downloadedThrough, 0)
 			return
 		}
 		slog.Warn("stat transcode directory for pruning", "component", "playback", "error", err, "session", opts.SessionID, "playback_session_id", opts.SessionID)
-		s.finishSegmentPrune(generation, fromSegment, targetFloor, downloadedThrough, segmentPruneRetryDelay)
+		retryFloor := fromSegment
+		if pruneBeforeStart {
+			retryFloor = fromFloor
+		}
+		s.finishSegmentPrune(generation, retryFloor, targetFloor, downloadedThrough, segmentPruneRetryDelay)
 		return
 	}
 
-	processedFloor := toSegment
+	var candidates []segmentPruneCandidate
+	moreCandidates := false
+	if pruneBeforeStart {
+		entries, readErr := os.ReadDir(outputDir)
+		if readErr != nil {
+			slog.Warn("read transcode directory for preserved segment pruning", "component", "playback", "error", readErr, "session", opts.SessionID, "playback_session_id", opts.SessionID)
+			s.finishSegmentPrune(generation, fromFloor, targetFloor, downloadedThrough, segmentPruneRetryDelay)
+			return
+		}
+		for _, entry := range entries {
+			segment, parseErr := ParseSegmentNumber(entry.Name())
+			if entry.IsDir() || parseErr != nil || segment >= targetFloor || entry.Name() != segmentFilename(segment, opts) {
+				continue
+			}
+			if len(candidates) == segmentPruneBatchSize {
+				moreCandidates = true
+				break
+			}
+			candidates = append(candidates, segmentPruneCandidate{
+				number: segment,
+				path:   filepath.Join(outputDir, entry.Name()),
+			})
+		}
+	} else {
+		toSegment := min(targetFloor, fromSegment+segmentPruneBatchSize)
+		for segment := fromSegment; segment < toSegment; segment++ {
+			candidates = append(candidates, segmentPruneCandidate{
+				number: segment,
+				path:   filepath.Join(outputDir, segmentFilename(segment, opts)),
+			})
+		}
+		moreCandidates = toSegment < targetFloor
+	}
+	if len(candidates) == 0 && !moreCandidates {
+		s.finishSegmentPrune(generation, targetFloor, targetFloor, downloadedThrough, 0)
+		return
+	}
+
+	processedFloor := targetFloor
+	if !pruneBeforeStart {
+		processedFloor = candidates[len(candidates)-1].number + 1
+	}
 	var retryAfter time.Duration
 	removed := 0
 	var freedBytes int64
-	for segment := fromSegment; segment < toSegment; segment++ {
-		path := filepath.Join(outputDir, segmentFilename(segment, opts))
-		info, err := os.Stat(path)
+	for _, candidate := range candidates {
+		info, err := os.Stat(candidate.path)
 		if err != nil {
 			if errors.Is(err, os.ErrNotExist) {
 				continue
 			}
-			processedFloor, retryAfter = earlierPruneRetry(processedFloor, retryAfter, segment, segmentPruneRetryDelay)
-			slog.Warn("stat downloaded transcode segment", "component", "playback", "error", err, "segment", segment, "session", opts.SessionID, "playback_session_id", opts.SessionID)
+			if pruneBeforeStart {
+				retryAfter = max(retryAfter, segmentPruneRetryDelay)
+			} else {
+				processedFloor, retryAfter = earlierPruneRetry(processedFloor, retryAfter, candidate.number, segmentPruneRetryDelay)
+			}
+			slog.Warn("stat downloaded transcode segment", "component", "playback", "error", err, "segment", candidate.number, "session", opts.SessionID, "playback_session_id", opts.SessionID)
 			continue
 		}
 		freshUntil := info.ModTime().Add(freshGuard)
 		if delay := time.Until(freshUntil); delay > 0 {
-			processedFloor, retryAfter = earlierPruneRetry(processedFloor, retryAfter, segment, delay)
+			if pruneBeforeStart {
+				retryAfter = max(retryAfter, delay)
+			} else {
+				processedFloor, retryAfter = earlierPruneRetry(processedFloor, retryAfter, candidate.number, delay)
+			}
 			continue
 		}
 
@@ -145,17 +202,24 @@ func (s *TranscodeSession) pruneDownloadedSegments(generation uint64, downloaded
 			s.mu.Unlock()
 			return
 		}
-		removeErr := os.Remove(path)
+		removeErr := os.Remove(candidate.path)
 		s.mu.Unlock()
 		if removeErr != nil {
 			if !errors.Is(removeErr, os.ErrNotExist) {
-				processedFloor, retryAfter = earlierPruneRetry(processedFloor, retryAfter, segment, segmentPruneRetryDelay)
-				slog.Warn("remove downloaded transcode segment", "component", "playback", "error", removeErr, "segment", segment, "session", opts.SessionID, "playback_session_id", opts.SessionID)
+				if pruneBeforeStart {
+					retryAfter = max(retryAfter, segmentPruneRetryDelay)
+				} else {
+					processedFloor, retryAfter = earlierPruneRetry(processedFloor, retryAfter, candidate.number, segmentPruneRetryDelay)
+				}
+				slog.Warn("remove downloaded transcode segment", "component", "playback", "error", removeErr, "segment", candidate.number, "session", opts.SessionID, "playback_session_id", opts.SessionID)
 			}
 			continue
 		}
 		removed++
 		freedBytes += info.Size()
+	}
+	if pruneBeforeStart && (moreCandidates || retryAfter > 0) {
+		processedFloor = fromFloor
 	}
 
 	s.finishSegmentPrune(generation, processedFloor, targetFloor, downloadedThrough, retryAfter)
