@@ -1,6 +1,7 @@
 package handlers
 
 import (
+	"context"
 	"log/slog"
 	"net/http"
 	"sort"
@@ -36,7 +37,17 @@ type DeviceHandler struct {
 	// never that it is unguarded.
 	UserRepo      userLookup
 	ProfileTokens *access.ProfileTokenService
+
+	// ServerSettings, when set, is consulted for the opt-in
+	// devices.forget_requires_primary policy. Nil reads as the default: any
+	// profile may forget its own devices.
+	ServerSettings ServerSettingReader
 }
+
+// forgetRequiresPrimarySettingKey is the opt-in server setting that reserves
+// forgetting a device for the household parent. It defaults to off, keeping
+// forget self-service; clearing a device's settings is never restricted.
+const forgetRequiresPrimarySettingKey = "devices.forget_requires_primary"
 
 func NewDeviceHandler(provider userstore.UserStoreProvider) *DeviceHandler {
 	return &DeviceHandler{storeProvider: provider}
@@ -199,6 +210,24 @@ func (h *DeviceHandler) removeDevice(w http.ResponseWriter, r *http.Request, for
 		profileID = named
 	}
 
+	// Forgetting is destructive — the device drops out of the registry — so a
+	// server may opt to reserve it for the household parent. The clear-settings
+	// variant stays open to every profile: a reset is recoverable. Same guard
+	// as the cross-profile path, so a PIN-locked primary still has to present
+	// its token here.
+	if forget && h.forgetRestrictedToPrimary(r.Context()) {
+		allowed, err := canManageHousehold(r, store, h.UserRepo, h.ProfileTokens)
+		if err != nil {
+			writeProfileManagementPermissionError(w, err)
+			return
+		}
+		if !allowed {
+			writeError(w, http.StatusForbidden, "forbidden",
+				"Forgetting a device on this server requires the primary profile or admin access")
+			return
+		}
+	}
+
 	// A device this profile never registered is not this caller's to remove.
 	// 404 rather than 403: a 403 would confirm the id exists somewhere.
 	//
@@ -264,6 +293,26 @@ func (h *DeviceHandler) removeDevice(w http.ResponseWriter, r *http.Request, for
 	})
 
 	w.WriteHeader(http.StatusNoContent)
+}
+
+// forgetRestrictedToPrimary reports whether this server opted in to
+// devices.forget_requires_primary. Unwired, unset, and unreadable all read as
+// false — the restriction is opt-in, so anything short of an explicit "true"
+// keeps the default self-service behavior.
+func (h *DeviceHandler) forgetRestrictedToPrimary(ctx context.Context) bool {
+	if h.ServerSettings == nil {
+		return false
+	}
+	value, err := h.ServerSettings.Get(ctx, forgetRequiresPrimarySettingKey)
+	if err != nil {
+		// Fail open: an unreadable setting must not brick every forget. But say
+		// so — this gates a destructive action, and a silently skipped
+		// restriction reads as "my setting didn't apply".
+		slog.WarnContext(ctx, "device forget restriction setting read failed; allowing self-service forget",
+			"component", "api", "error", err)
+		return false
+	}
+	return value == "true" //nolint:goconst // Boolean server settings are the strings "true"/"false".
 }
 
 type deviceKey struct {
