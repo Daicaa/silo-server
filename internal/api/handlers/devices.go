@@ -215,16 +215,23 @@ func (h *DeviceHandler) removeDevice(w http.ResponseWriter, r *http.Request, for
 	// variant stays open to every profile: a reset is recoverable. Same guard
 	// as the cross-profile path, so a PIN-locked primary still has to present
 	// its token here.
-	if forget && h.forgetRestrictedToPrimary(r.Context()) {
-		allowed, err := canManageHousehold(r, store, h.UserRepo, h.ProfileTokens)
+	if forget {
+		restricted, err := h.forgetRestrictedToPrimary(r.Context())
 		if err != nil {
-			writeProfileManagementPermissionError(w, err)
+			writeError(w, http.StatusInternalServerError, "internal_error", "Failed to read server settings")
 			return
 		}
-		if !allowed {
-			writeError(w, http.StatusForbidden, "forbidden",
-				"Forgetting a device on this server requires the primary profile or admin access")
-			return
+		if restricted {
+			allowed, err := canManageHousehold(r, store, h.UserRepo, h.ProfileTokens)
+			if err != nil {
+				writeProfileManagementPermissionError(w, err)
+				return
+			}
+			if !allowed {
+				writeError(w, http.StatusForbidden, "forbidden",
+					"Forgetting a device on this server requires the primary profile or admin access")
+				return
+			}
 		}
 	}
 
@@ -296,23 +303,21 @@ func (h *DeviceHandler) removeDevice(w http.ResponseWriter, r *http.Request, for
 }
 
 // forgetRestrictedToPrimary reports whether this server opted in to
-// devices.forget_requires_primary. Unwired, unset, and unreadable all read as
-// false — the restriction is opt-in, so anything short of an explicit "true"
-// keeps the default self-service behavior.
-func (h *DeviceHandler) forgetRestrictedToPrimary(ctx context.Context) bool {
+// devices.forget_requires_primary. Unwired and unset read as false — the
+// restriction is opt-in. An unreadable setting is an error: this gates a
+// destructive action, so the caller must reject the request rather than
+// guess which way the operator configured it.
+func (h *DeviceHandler) forgetRestrictedToPrimary(ctx context.Context) (bool, error) {
 	if h.ServerSettings == nil {
-		return false
+		return false, nil
 	}
 	value, err := h.ServerSettings.Get(ctx, forgetRequiresPrimarySettingKey)
 	if err != nil {
-		// Fail open: an unreadable setting must not brick every forget. But say
-		// so — this gates a destructive action, and a silently skipped
-		// restriction reads as "my setting didn't apply".
-		slog.WarnContext(ctx, "device forget restriction setting read failed; allowing self-service forget",
+		slog.WarnContext(ctx, "device forget restriction setting read failed; rejecting forget",
 			"component", "api", "error", err)
-		return false
+		return false, err
 	}
-	return value == "true" //nolint:goconst // Boolean server settings are the strings "true"/"false".
+	return value == "true", nil //nolint:goconst // Boolean server settings are the strings "true"/"false".
 }
 
 type deviceKey struct {

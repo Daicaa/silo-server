@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -413,6 +414,56 @@ func restrictedForgetHandler(t *testing.T, value string) (*DeviceHandler, userst
 		forgetRequiresPrimarySettingKey: value,
 	}}
 	return handler, store
+}
+
+// erroringSettingsReader simulates the server-settings store being
+// unreachable, the one state where the forget policy cannot be evaluated.
+type erroringSettingsReader struct{}
+
+func (erroringSettingsReader) Get(context.Context, string) (string, error) {
+	return "", errors.New("settings store unavailable")
+}
+
+// An unreadable policy must reject the forget rather than guess: failing open
+// would let a non-primary profile forget devices while the operator believes
+// the restriction is enforced. The device and its settings must survive.
+func TestForgetDevice_SettingReadErrorRejectsAndKeepsDevice(t *testing.T) {
+	handler, store := householdDevicesHandler(t)
+	handler.ServerSettings = erroringSettingsReader{}
+	seedDevice(t, store, "profile-2", "device-9", "Robin's iPad")
+	seedDeviceValue(t, store, "profile-2", "device-9", "player.hdr_enabled", `false`)
+
+	rec := routeDevice(t, handler, http.MethodDelete, "/devices/device-9", "device-9",
+		"profile-2", handler.HandleForgetDevice)
+	if rec.Code != http.StatusInternalServerError {
+		t.Fatalf("forget with unreadable policy = %d, want 500: %s", rec.Code, rec.Body.String())
+	}
+
+	registry := store.(userstore.DeviceRegistry)
+	exists, err := registry.DeviceExists(context.Background(), "profile-2", "device-9")
+	if err != nil {
+		t.Fatalf("DeviceExists: %v", err)
+	}
+	if !exists {
+		t.Error("a rejected forget still removed the device")
+	}
+	if got := storedDeviceIDFor(t, store, "player.hdr_enabled"); got != "device-9" {
+		t.Errorf("a rejected forget still removed the setting row (device %q)", got)
+	}
+}
+
+// Clear-settings never consults the forget policy, so an unreadable settings
+// store must not affect it.
+func TestClearDeviceSettings_SettingReadErrorStillClears(t *testing.T) {
+	handler, store := householdDevicesHandler(t)
+	handler.ServerSettings = erroringSettingsReader{}
+	seedDevice(t, store, "profile-2", "device-9", "Robin's iPad")
+
+	rec := routeDevice(t, handler, http.MethodDelete, "/devices/device-9/settings", "device-9",
+		"profile-2", handler.HandleClearDeviceSettings)
+	if rec.Code != http.StatusNoContent {
+		t.Fatalf("clear with unreadable policy = %d, want 204: %s", rec.Code, rec.Body.String())
+	}
 }
 
 // The restriction is opt-in: with the setting stored as false a non-primary
