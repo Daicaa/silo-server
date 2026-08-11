@@ -387,7 +387,7 @@ func (s *Server) proxyToTranscodeNode(w http.ResponseWriter, r *http.Request, cl
 		return
 	}
 	if isMediaSegment && generation != "" && r.Method == http.MethodGet &&
-		sw.CompletedFullResponse(r.Context(), transcodeproxy.FullRepresentationSize(resp)) {
+		sw.CompletedFullResponse(transcodeproxy.FullRepresentationSize(resp)) {
 		if ackErr := transcodeproxy.Acknowledge(r.Context(), s.httpClient, claims.TranscodeNode+path, cfg.Auth.JWTSecret, generation); ackErr != nil {
 			slog.WarnContext(r.Context(), "acknowledge transcode segment completion", "component", "proxy", "error", ackErr, "playback_session_id", claims.SessionID)
 		}

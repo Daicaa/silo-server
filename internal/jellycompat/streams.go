@@ -540,7 +540,7 @@ func (h *PlaybackHandler) HandleHLSSegment(w http.ResponseWriter, r *http.Reques
 	sw := httpstream.NewRollingDeadlineWriter(w)
 	http.ServeContent(sw, r, segmentLease.Info.Name(), segmentLease.Info.ModTime(), segmentLease.File)
 	if r.Method == http.MethodGet &&
-		sw.CompletedFullResponse(r.Context(), segmentLease.Info.Size()) {
+		sw.CompletedFullResponse(segmentLease.Info.Size()) {
 		if segNum, parseErr := playback.ParseSegmentNumber(name); parseErr == nil {
 			transcodeSession.ReportSegmentDownloadedForGeneration(segNum, segmentLease.Generation)
 		}

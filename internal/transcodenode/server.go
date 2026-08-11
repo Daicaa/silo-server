@@ -1013,7 +1013,7 @@ func (s *Server) handleSegment(w http.ResponseWriter, r *http.Request) {
 	sw := httpstream.NewRollingDeadlineWriter(w)
 	http.ServeContent(sw, r, segmentLease.Info.Name(), segmentLease.Info.ModTime(), segmentLease.File)
 	if !proxied && r.Method == http.MethodGet &&
-		sw.CompletedFullResponse(r.Context(), segmentLease.Info.Size()) {
+		sw.CompletedFullResponse(segmentLease.Info.Size()) {
 		if segmentNumber, parseErr := playback.ParseSegmentNumber(name); parseErr == nil {
 			session.ReportSegmentDownloadedForGeneration(segmentNumber, segmentLease.Generation)
 		}

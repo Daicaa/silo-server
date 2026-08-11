@@ -1511,7 +1511,7 @@ func (h *PlaybackHandler) HandleGetTranscodeSegment(w http.ResponseWriter, r *ht
 	sw := httpstream.NewRollingDeadlineWriter(w)
 	http.ServeContent(sw, r, segmentLease.Info.Name(), segmentLease.Info.ModTime(), segmentLease.File)
 	if r.Method == http.MethodGet &&
-		sw.CompletedFullResponse(r.Context(), segmentLease.Info.Size()) {
+		sw.CompletedFullResponse(segmentLease.Info.Size()) {
 		if segNum, parseErr := playback.ParseSegmentNumber(segmentName); parseErr == nil {
 			transcodeSession.ReportSegmentDownloadedForGeneration(segNum, segmentLease.Generation)
 		}
@@ -1632,7 +1632,7 @@ func (h *PlaybackHandler) proxyToTranscodeNode(w http.ResponseWriter, r *http.Re
 	}
 	fullSize := transcodeproxy.FullRepresentationSize(resp)
 	if isMediaSegment && generation != "" && r.Method == http.MethodGet &&
-		sw.CompletedFullResponse(r.Context(), fullSize) {
+		sw.CompletedFullResponse(fullSize) {
 		if ackErr := transcodeproxy.Acknowledge(r.Context(), http.DefaultClient, transcodeNodeURL+path, h.JWTSecret, generation); ackErr != nil {
 			slog.WarnContext(r.Context(), "acknowledge transcode segment completion", "component", "api", "error", ackErr, "playback_session_id", sessionID)
 		}

@@ -274,12 +274,14 @@ func TestServeContentReadFromOutcomeCompletedAndCounted(t *testing.T) {
 func TestCompletedFullResponse(t *testing.T) {
 	const body = "complete segment"
 	tests := []struct {
-		name        string
-		rangeHeader string
-		method      string
-		want        bool
+		name             string
+		rangeHeader      string
+		method           string
+		cancelAfterWrite bool
+		want             bool
 	}{
 		{name: "ordinary get", method: http.MethodGet, want: true},
+		{name: "completed get with canceled context", method: http.MethodGet, cancelAfterWrite: true, want: true},
 		{name: "open ended full range", method: http.MethodGet, rangeHeader: "bytes=0-", want: true},
 		{name: "explicit full range", method: http.MethodGet, rangeHeader: "bytes=0-15", want: true},
 		{name: "partial range", method: http.MethodGet, rangeHeader: "bytes=1-", want: false},
@@ -289,10 +291,15 @@ func TestCompletedFullResponse(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			rr := httptest.NewRecorder()
 			sw := newRollingDeadlineWriter(rr, time.Second, 0)
-			req := httptest.NewRequest(tt.method, "/segment.ts", nil)
+			ctx, cancel := context.WithCancel(context.Background())
+			t.Cleanup(cancel)
+			req := httptest.NewRequest(tt.method, "/segment.ts", nil).WithContext(ctx)
 			req.Header.Set("Range", tt.rangeHeader)
 			http.ServeContent(sw, req, "segment.ts", time.Time{}, strings.NewReader(body))
-			if got := sw.CompletedFullResponse(req.Context(), int64(len(body))); got != tt.want {
+			if tt.cancelAfterWrite {
+				cancel()
+			}
+			if got := sw.CompletedFullResponse(int64(len(body))); got != tt.want {
 				t.Fatalf("CompletedFullResponse = %v, want %v (status=%d range=%q bytes=%d)",
 					got, tt.want, sw.StatusCode(), rr.Header().Get("Content-Range"), sw.BytesWritten())
 			}
