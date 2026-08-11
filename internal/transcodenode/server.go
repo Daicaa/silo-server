@@ -24,6 +24,7 @@ import (
 	"github.com/Silo-Server/silo-server/internal/nodesessions"
 	"github.com/Silo-Server/silo-server/internal/playback"
 	"github.com/Silo-Server/silo-server/internal/streamtoken"
+	"github.com/Silo-Server/silo-server/internal/transcodeproxy"
 )
 
 // TranscodeStartRequest is the JSON body for POST /transcode/start.
@@ -1004,9 +1005,9 @@ func (s *Server) handleSegment(w http.ResponseWriter, r *http.Request) {
 
 	w.Header().Set("Cache-Control", "no-store, max-age=0")
 	w.Header().Set("Pragma", "no-cache")
-	proxied := r.Header.Get(playback.TranscodeProxyRequestHeader) == "1"
+	proxied := r.Header.Get(transcodeproxy.RequestHeader) == "1"
 	if proxied {
-		w.Header().Set(playback.TranscodeSegmentGenerationHeader, segmentLease.GenerationToken)
+		w.Header().Set(transcodeproxy.GenerationHeader, segmentLease.GenerationToken)
 	}
 	defer func() { _ = segmentLease.Close() }()
 	sw := httpstream.NewRollingDeadlineWriter(w)
@@ -1031,7 +1032,7 @@ func (s *Server) handleSegmentDownloaded(w http.ResponseWriter, r *http.Request)
 		http.Error(w, "invalid segment", http.StatusBadRequest)
 		return
 	}
-	generationToken := r.Header.Get(playback.TranscodeSegmentGenerationHeader)
+	generationToken := r.Header.Get(transcodeproxy.GenerationHeader)
 	if generationToken == "" {
 		http.Error(w, "invalid segment generation", http.StatusBadRequest)
 		return

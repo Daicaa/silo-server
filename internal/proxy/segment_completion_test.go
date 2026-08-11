@@ -1,4 +1,4 @@
-package handlers
+package proxy
 
 import (
 	"io"
@@ -9,13 +9,16 @@ import (
 	"testing"
 	"time"
 
+	"github.com/Silo-Server/silo-server/internal/config"
+	"github.com/Silo-Server/silo-server/internal/nodeconfig"
+	"github.com/Silo-Server/silo-server/internal/streamtoken"
 	"github.com/Silo-Server/silo-server/internal/transcodeproxy"
 )
 
-func TestProxyToTranscodeNodeAcknowledgesOnlyFullDownstreamResponse(t *testing.T) {
+func TestTranscodeProxyAcknowledgesOnlyFullDownstreamResponse(t *testing.T) {
 	const (
 		body       = "complete segment"
-		generation = "17"
+		generation = "incarnation:17"
 	)
 	tests := []struct {
 		name        string
@@ -53,15 +56,12 @@ func TestProxyToTranscodeNodeAcknowledgesOnlyFullDownstreamResponse(t *testing.T
 			}))
 			defer node.Close()
 
-			handler := &PlaybackHandler{JWTSecret: "proxy-test-secret"}
-			req := withPlaybackRouteParam(
-				httptest.NewRequest(http.MethodGet, "/playback/transcode/public/segment/seg_00007.ts", nil),
-				"session_id",
-				"public",
-			)
+			server := newCompletionTestProxy(node.Client())
+			claims := &streamtoken.Claims{SessionID: "public", TranscodeNode: node.URL}
+			req := httptest.NewRequest(http.MethodGet, "/stream/transcode/token/segment/seg_00007.ts", nil)
 			req.Header.Set("Range", tt.rangeHeader)
 			rr := httptest.NewRecorder()
-			handler.proxyToTranscodeNode(rr, req, node.URL, "/transcode/remote/segment/seg_00007.ts")
+			server.proxyToTranscodeNode(rr, req, claims, "/transcode/remote/segment/seg_00007.ts")
 
 			if rr.Code != tt.wantStatus {
 				t.Fatalf("status = %d, want %d; body = %q", rr.Code, tt.wantStatus, rr.Body.String())
@@ -79,8 +79,7 @@ func TestProxyToTranscodeNodeAcknowledgesOnlyFullDownstreamResponse(t *testing.T
 	}
 }
 
-func TestProxyToTranscodeNodeDoesNotAcknowledgeFailedDownstreamWrite(t *testing.T) {
-	const body = "complete segment"
+func TestTranscodeProxyDoesNotAcknowledgeFailedDownstreamWrite(t *testing.T) {
 	var acknowledgements atomic.Int32
 	node := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method == http.MethodPost {
@@ -88,36 +87,43 @@ func TestProxyToTranscodeNodeDoesNotAcknowledgeFailedDownstreamWrite(t *testing.
 			w.WriteHeader(http.StatusNoContent)
 			return
 		}
-		w.Header().Set(transcodeproxy.GenerationHeader, "21")
-		http.ServeContent(w, r, "seg_00007.ts", time.Time{}, strings.NewReader(body))
+		w.Header().Set(transcodeproxy.GenerationHeader, "incarnation:21")
+		http.ServeContent(w, r, "seg_00007.ts", time.Time{}, strings.NewReader("complete segment"))
 	}))
 	defer node.Close()
 
-	handler := &PlaybackHandler{JWTSecret: "proxy-test-secret"}
-	req := withPlaybackRouteParam(
-		httptest.NewRequest(http.MethodGet, "/playback/transcode/public/segment/seg_00007.ts", nil),
-		"session_id",
-		"public",
-	)
-	w := &failingProxyResponseWriter{header: make(http.Header), remaining: 5}
-	handler.proxyToTranscodeNode(w, req, node.URL, "/transcode/remote/segment/seg_00007.ts")
+	server := newCompletionTestProxy(node.Client())
+	claims := &streamtoken.Claims{SessionID: "public", TranscodeNode: node.URL}
+	req := httptest.NewRequest(http.MethodGet, "/stream/transcode/token/segment/seg_00007.ts", nil)
+	w := &failingCompletionResponseWriter{header: make(http.Header), remaining: 5}
+	server.proxyToTranscodeNode(w, req, claims, "/transcode/remote/segment/seg_00007.ts")
 
 	if got := acknowledgements.Load(); got != 0 {
 		t.Fatalf("failed downstream transfer produced %d acknowledgement(s)", got)
 	}
 }
 
-type failingProxyResponseWriter struct {
+func newCompletionTestProxy(client *http.Client) *Server {
+	watcher := nodeconfig.NewWatcher(nil, nil, nil, nodeconfig.BootstrapOverrides{})
+	cfg := &config.Config{}
+	cfg.Auth.JWTSecret = "proxy-test-secret"
+	watcher.SetConfigForTest(cfg)
+	server := NewServer(watcher, nil)
+	server.httpClient = client
+	return server
+}
+
+type failingCompletionResponseWriter struct {
 	header    http.Header
 	status    int
 	remaining int
 }
 
-func (w *failingProxyResponseWriter) Header() http.Header { return w.header }
+func (w *failingCompletionResponseWriter) Header() http.Header { return w.header }
 
-func (w *failingProxyResponseWriter) WriteHeader(status int) { w.status = status }
+func (w *failingCompletionResponseWriter) WriteHeader(status int) { w.status = status }
 
-func (w *failingProxyResponseWriter) Write(p []byte) (int, error) {
+func (w *failingCompletionResponseWriter) Write(p []byte) (int, error) {
 	if w.remaining <= 0 {
 		return 0, io.ErrClosedPipe
 	}

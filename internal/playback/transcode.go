@@ -105,14 +105,6 @@ const (
 	transcodeHWQSV     = "qsv"
 	transcodeHWVAAPI   = "vaapi"
 	transcodeHWNVENC   = "nvenc"
-
-	// TranscodeProxyRequestHeader marks a segment hop whose immediate HTTP
-	// consumer is the central API rather than the playback client. The node
-	// defers download accounting until the API confirms downstream completion.
-	TranscodeProxyRequestHeader = "X-Silo-Transcode-Proxy"
-	// TranscodeSegmentGenerationHeader binds that downstream acknowledgement to
-	// the exact FFmpeg timeline whose segment descriptor the node served.
-	TranscodeSegmentGenerationHeader = "X-Silo-Transcode-Segment-Generation"
 )
 
 // TranscodeSession manages a running ffmpeg HLS transcode process.

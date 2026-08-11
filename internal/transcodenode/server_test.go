@@ -20,6 +20,7 @@ import (
 	"github.com/Silo-Server/silo-server/internal/nodesessions"
 	"github.com/Silo-Server/silo-server/internal/playback"
 	"github.com/Silo-Server/silo-server/internal/streamtoken"
+	"github.com/Silo-Server/silo-server/internal/transcodeproxy"
 )
 
 const testSecret = "node-reconstruct-test-secret"
@@ -75,13 +76,13 @@ func TestProxiedSegmentCompletionRequiresDownstreamAcknowledgement(t *testing.T)
 		httptest.NewRequest(http.MethodGet, "/transcode/"+sessionID+"/segment/"+segmentName, nil),
 		map[string]string{"session_id": sessionID, "name": segmentName},
 	)
-	segmentReq.Header.Set(playback.TranscodeProxyRequestHeader, "1")
+	segmentReq.Header.Set(transcodeproxy.RequestHeader, "1")
 	segmentRR := httptest.NewRecorder()
 	server.handleSegment(segmentRR, segmentReq)
 	if segmentRR.Code != http.StatusOK {
 		t.Fatalf("segment status = %d, body = %q", segmentRR.Code, segmentRR.Body.String())
 	}
-	generation := segmentRR.Header().Get(playback.TranscodeSegmentGenerationHeader)
+	generation := segmentRR.Header().Get(transcodeproxy.GenerationHeader)
 	if generation == "" {
 		t.Fatal("proxied segment omitted generation")
 	}
@@ -93,7 +94,7 @@ func TestProxiedSegmentCompletionRequiresDownstreamAcknowledgement(t *testing.T)
 		httptest.NewRequest(http.MethodPost, "/transcode/"+sessionID+"/segment/"+segmentName+"/downloaded", nil),
 		map[string]string{"session_id": sessionID, "name": segmentName},
 	)
-	ackReq.Header.Set(playback.TranscodeSegmentGenerationHeader, generation)
+	ackReq.Header.Set(transcodeproxy.GenerationHeader, generation)
 	ackRR := httptest.NewRecorder()
 	server.handleSegmentDownloaded(ackRR, ackReq)
 	if ackRR.Code != http.StatusNoContent {
@@ -132,7 +133,7 @@ func TestProxiedSegmentCompletionRejectsStaleGeneration(t *testing.T) {
 		httptest.NewRequest(http.MethodPost, "/transcode/"+sessionID+"/segment/"+segmentName+"/downloaded", nil),
 		map[string]string{"session_id": sessionID, "name": segmentName},
 	)
-	ackReq.Header.Set(playback.TranscodeSegmentGenerationHeader, "999")
+	ackReq.Header.Set(transcodeproxy.GenerationHeader, "999")
 	ackRR := httptest.NewRecorder()
 	server.handleSegmentDownloaded(ackRR, ackReq)
 	if ackRR.Code != http.StatusNoContent {
