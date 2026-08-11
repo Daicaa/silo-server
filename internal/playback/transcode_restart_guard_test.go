@@ -9,14 +9,57 @@ import (
 	"time"
 )
 
-func TestForwardRestartRemovesSkippedBackBuffer(t *testing.T) {
+func TestForwardRestartPreservesConfiguredBackBuffer(t *testing.T) {
 	truePath, err := exec.LookPath("true")
 	if err != nil {
 		t.Skipf("`true` not found in PATH: %v", err)
 	}
 
 	dir := t.TempDir()
-	for _, segment := range []int{3, 40, 69, 70, 100} {
+	for _, segment := range []int{3, 40, 64, 65, 69, 70, 100} {
+		name := filepath.Join(dir, segmentFilename(segment, TranscodeOpts{}))
+		if err := os.WriteFile(name, []byte("segment"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	session := &TranscodeSession{
+		outputDir:            dir,
+		lastRequestedSegment: 70,
+		opts: TranscodeOpts{
+			OutputDir:               dir,
+			TargetCodecVideo:        "h264",
+			SegmentDuration:         4,
+			SegmentRetentionSeconds: 20,
+			StartSegmentNumber:      0,
+			FFmpegPath:              truePath,
+		},
+	}
+
+	if err := session.Restart(context.Background(), 400, 100); err != nil {
+		t.Fatalf("Restart: %v", err)
+	}
+	for _, segment := range []int{3, 40, 64} {
+		path := filepath.Join(dir, segmentFilename(segment, TranscodeOpts{}))
+		if _, err := os.Stat(path); !os.IsNotExist(err) {
+			t.Errorf("skipped segment %d survived forward restart: %v", segment, err)
+		}
+	}
+	for _, segment := range []int{65, 69, 70, 100} {
+		path := filepath.Join(dir, segmentFilename(segment, TranscodeOpts{}))
+		if _, err := os.Stat(path); err != nil {
+			t.Errorf("retained segment %d was removed: %v", segment, err)
+		}
+	}
+}
+
+func TestForwardRestartKeepsSegmentsWhenRetentionDisabled(t *testing.T) {
+	truePath, err := exec.LookPath("true")
+	if err != nil {
+		t.Skipf("`true` not found in PATH: %v", err)
+	}
+
+	dir := t.TempDir()
+	for _, segment := range []int{3, 40, 70} {
 		name := filepath.Join(dir, segmentFilename(segment, TranscodeOpts{}))
 		if err := os.WriteFile(name, []byte("segment"), 0o600); err != nil {
 			t.Fatal(err)
@@ -37,14 +80,11 @@ func TestForwardRestartRemovesSkippedBackBuffer(t *testing.T) {
 	if err := session.Restart(context.Background(), 400, 100); err != nil {
 		t.Fatalf("Restart: %v", err)
 	}
-	for _, segment := range []int{3, 40, 69, 70} {
+	for _, segment := range []int{3, 40, 70} {
 		path := filepath.Join(dir, segmentFilename(segment, TranscodeOpts{}))
-		if _, err := os.Stat(path); !os.IsNotExist(err) {
-			t.Errorf("skipped segment %d survived forward restart: %v", segment, err)
+		if _, err := os.Stat(path); err != nil {
+			t.Errorf("disabled retention removed segment %d: %v", segment, err)
 		}
-	}
-	if _, err := os.Stat(filepath.Join(dir, segmentFilename(100, TranscodeOpts{}))); err != nil {
-		t.Fatalf("segment at restart point was removed: %v", err)
 	}
 }
 

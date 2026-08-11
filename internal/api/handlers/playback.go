@@ -3683,8 +3683,7 @@ func (h *PlaybackHandler) HandleGetTranscodeSegment(w http.ResponseWriter, r *ht
 	h.touchSessionActivity(sessionID)
 
 	segmentName := chi.URLParam(r, "name")
-	downloadGeneration := transcodeSession.SegmentGeneration()
-	segmentFile, segmentInfo, err := transcodeSession.OpenSegment(segmentName)
+	segmentLease, err := transcodeSession.OpenSegment(segmentName)
 	if err != nil && errors.Is(err, playback.ErrSegmentNotFound) {
 		segNum, parseErr := playback.ParseSegmentNumber(segmentName)
 		if parseErr == nil {
@@ -3721,7 +3720,7 @@ func (h *PlaybackHandler) HandleGetTranscodeSegment(w http.ResponseWriter, r *ht
 					"session", sessionID,
 					"playback_session_id", sessionID,
 				)
-				segmentFile, segmentInfo, err = transcodeSession.WaitForOpenSegment(segmentName, decision.WaitTimeout)
+				segmentLease, err = transcodeSession.WaitForOpenSegment(segmentName, decision.WaitTimeout)
 				if err != nil && errors.Is(err, playback.ErrSegmentNotFound) {
 					slog.InfoContext(r.Context(), "transcode segment wait timeout", "component", "api",
 						"segment", segmentName,
@@ -3783,7 +3782,7 @@ func (h *PlaybackHandler) HandleGetTranscodeSegment(w http.ResponseWriter, r *ht
 					); restartErr == nil {
 						// Throttler + exit monitor re-arm via the session's
 						// restart hook.
-						segmentFile, segmentInfo, err = transcodeSession.WaitForOpenSegment(segmentName, 30*time.Second)
+						segmentLease, err = transcodeSession.WaitForOpenSegment(segmentName, 30*time.Second)
 						if err == nil && strings.EqualFold(transcodeSession.Opts().TargetCodecVideo, "copy") {
 							// Copy-mode seeks can resume as soon as the target segment
 							// exists, but that sometimes leaves the player one segment
@@ -3791,7 +3790,7 @@ func (h *PlaybackHandler) HandleGetTranscodeSegment(w http.ResponseWriter, r *ht
 							// for a single lookahead fragment when available so the
 							// first resumed playback window is less brittle.
 							nextSegmentName := fmt.Sprintf("seg_%05d.m4s", segNum+1)
-							if nextSegment, _, nextErr := transcodeSession.WaitForOpenSegment(nextSegmentName, 1200*time.Millisecond); nextErr == nil {
+							if nextSegment, nextErr := transcodeSession.WaitForOpenSegment(nextSegmentName, 1200*time.Millisecond); nextErr == nil {
 								_ = nextSegment.Close()
 							}
 						}
@@ -3801,7 +3800,7 @@ func (h *PlaybackHandler) HandleGetTranscodeSegment(w http.ResponseWriter, r *ht
 		} else if transcodeSession.IsRunning() {
 			// Non-numbered segment (e.g., init.mp4 for fMP4 HLS).
 			// Wait briefly — the init segment is written almost immediately.
-			segmentFile, segmentInfo, err = transcodeSession.WaitForOpenSegment(segmentName, 10*time.Second)
+			segmentLease, err = transcodeSession.WaitForOpenSegment(segmentName, 10*time.Second)
 		}
 	}
 	if err != nil {
@@ -3815,13 +3814,13 @@ func (h *PlaybackHandler) HandleGetTranscodeSegment(w http.ResponseWriter, r *ht
 
 	w.Header().Set("Cache-Control", "no-store, max-age=0")
 	w.Header().Set("Pragma", "no-cache")
-	defer func() { _ = segmentFile.Close() }()
+	defer func() { _ = segmentLease.Close() }()
 	sw := httpstream.NewRollingDeadlineWriter(w)
-	http.ServeContent(sw, r, segmentInfo.Name(), segmentInfo.ModTime(), segmentFile)
+	http.ServeContent(sw, r, segmentLease.Info.Name(), segmentLease.Info.ModTime(), segmentLease.File)
 	if r.Method == http.MethodGet &&
-		sw.CompletedFullResponse(r.Context(), segmentInfo.Size()) {
+		sw.CompletedFullResponse(r.Context(), segmentLease.Info.Size()) {
 		if segNum, parseErr := playback.ParseSegmentNumber(segmentName); parseErr == nil {
-			transcodeSession.ReportSegmentDownloadedForGeneration(segNum, downloadGeneration)
+			transcodeSession.ReportSegmentDownloadedForGeneration(segNum, segmentLease.Generation)
 		}
 	}
 }

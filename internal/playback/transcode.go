@@ -94,6 +94,7 @@ type TranscodeSession struct {
 	stdinPipe            io.WriteCloser
 	lastRequestedSegment int
 	lastPruneFloor       int
+	lastPruneHighWater   int
 	segmentPruneRunning  bool
 	segmentGeneration    uint64
 	throttler            *TranscodeThrottler
@@ -207,6 +208,7 @@ func StartTranscode(ctx context.Context, opts TranscodeOpts) (*TranscodeSession,
 		stderr:                   newBoundedTailBuffer(stderrTailMaxBytes),
 		lastRequestedSegment:     opts.StartSegmentNumber,
 		lastPruneFloor:           opts.StartSegmentNumber - 1,
+		lastPruneHighWater:       opts.StartSegmentNumber,
 		reserveHWDeviceOnRestart: reserveHWDeviceOnRestart,
 	}
 
@@ -1625,29 +1627,48 @@ func (s *TranscodeSession) GetSegment(name string) (string, error) {
 	return segPath, nil
 }
 
-// OpenSegment opens a completed segment for serving. Keeping the descriptor
-// open while the response is written makes it a filesystem-backed lease: a
+// SegmentLease binds an opened segment descriptor to the FFmpeg generation it
+// came from. Keeping the descriptor open makes it a filesystem-backed lease: a
 // concurrent prune may unlink the directory entry, but the response can still
 // read the complete file on POSIX filesystems.
-func (s *TranscodeSession) OpenSegment(name string) (*os.File, os.FileInfo, error) {
+type SegmentLease struct {
+	File       *os.File
+	Info       os.FileInfo
+	Generation uint64
+}
+
+// Close releases the opened segment descriptor.
+func (l *SegmentLease) Close() error {
+	return l.File.Close()
+}
+
+// OpenSegment opens a completed segment for serving and captures its FFmpeg
+// generation atomically with the open.
+func (s *TranscodeSession) OpenSegment(name string) (*SegmentLease, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.restarting {
+		return nil, ErrSegmentNotFound
+	}
+
 	clean := filepath.Base(name)
 	segment, err := os.Open(filepath.Join(s.outputDir, clean))
 	if err != nil {
 		if os.IsNotExist(err) {
-			return nil, nil, ErrSegmentNotFound
+			return nil, ErrSegmentNotFound
 		}
-		return nil, nil, fmt.Errorf("open segment: %w", err)
+		return nil, fmt.Errorf("open segment: %w", err)
 	}
 	info, err := segment.Stat()
 	if err != nil {
 		_ = segment.Close()
-		return nil, nil, fmt.Errorf("stat segment: %w", err)
+		return nil, fmt.Errorf("stat segment: %w", err)
 	}
 	if info.Size() <= 0 {
 		_ = segment.Close()
-		return nil, nil, ErrSegmentNotFound
+		return nil, ErrSegmentNotFound
 	}
-	return segment, info, nil
+	return &SegmentLease{File: segment, Info: info, Generation: s.segmentGeneration}, nil
 }
 
 // Close terminates the ffmpeg process and removes the temporary output directory.
@@ -1762,20 +1783,35 @@ func (s *TranscodeSession) cleanStaleSegments(startSegment int) {
 	}
 }
 
-// cleanSkippedSegments removes media that a forward seek jumped past. The
-// prior back buffer cannot remain eligible for the normal pruner after the
-// process start number advances, so leaving it in place would accumulate one
-// abandoned retention window per forward seek. Open response descriptors keep
-// any in-flight transfer valid after the directory entries are unlinked.
-func (s *TranscodeSession) cleanSkippedSegments(startSegment int) {
-	entries, err := os.ReadDir(s.outputDir)
-	if err != nil {
+// cleanSkippedSegments removes media older than the retained window before a
+// forward restart. The configured back buffer and the current process's startup
+// files remain available for immediate backward recovery.
+func (s *TranscodeSession) cleanSkippedSegments(downloadedThrough int, opts TranscodeOpts) {
+	if opts.SegmentRetentionSeconds <= 0 {
 		return
 	}
+	floor, complete, err := segmentRetentionFloor(s.outputDir, opts, downloadedThrough)
+	if err != nil {
+		slog.Warn("resolve skipped transcode retention floor", "component", "playback", "error", err, "session", opts.SessionID, "playback_session_id", opts.SessionID)
+		return
+	}
+	if !complete {
+		return
+	}
+
+	entries, err := os.ReadDir(s.outputDir)
+	if err != nil {
+		slog.Warn("read transcode directory for skipped cleanup", "component", "playback", "error", err, "session", opts.SessionID, "playback_session_id", opts.SessionID)
+		return
+	}
+	startupEnd := opts.StartSegmentNumber + startupSegmentRequirement(opts)
 	for _, entry := range entries {
 		segNum, parseErr := ParseSegmentNumber(entry.Name())
-		if parseErr == nil && segNum < startSegment {
-			_ = os.Remove(filepath.Join(s.outputDir, entry.Name()))
+		if parseErr != nil || segNum < startupEnd || segNum >= floor {
+			continue
+		}
+		if removeErr := os.Remove(filepath.Join(s.outputDir, entry.Name())); removeErr != nil && !errors.Is(removeErr, os.ErrNotExist) {
+			slog.Warn("remove skipped transcode segment", "component", "playback", "error", removeErr, "segment", segNum, "session", opts.SessionID, "playback_session_id", opts.SessionID)
 		}
 	}
 }
@@ -1824,6 +1860,7 @@ func (s *TranscodeSession) restart(
 	previousRequestedSegment := s.lastRequestedSegment
 	s.lastRequestedSegment = startSegment
 	s.lastPruneFloor = startSegment - 1
+	s.lastPruneHighWater = startSegment
 	cancelCurrent := s.cancel
 	done := s.done
 	s.mu.Unlock()
@@ -1849,7 +1886,7 @@ func (s *TranscodeSession) restart(
 	s.mu.Unlock()
 
 	if startSegment > previousRequestedSegment {
-		s.cleanSkippedSegments(startSegment)
+		s.cleanSkippedSegments(previousRequestedSegment, opts)
 	}
 
 	// Copy-mode restarts must clean stale segments so ffmpeg writes fresh
@@ -1990,15 +2027,15 @@ func (s *TranscodeSession) WaitForSegment(name string, timeout time.Duration) (s
 // WaitForOpenSegment is the opened-file counterpart to WaitForSegment. It
 // closes the stat-to-open race for HTTP serving while preserving the same
 // restart and ffmpeg-exit error contract.
-func (s *TranscodeSession) WaitForOpenSegment(name string, timeout time.Duration) (*os.File, os.FileInfo, error) {
+func (s *TranscodeSession) WaitForOpenSegment(name string, timeout time.Duration) (*SegmentLease, error) {
 	deadline := time.After(timeout)
 	for {
-		segment, info, err := s.OpenSegment(name)
+		segment, err := s.OpenSegment(name)
 		if err == nil {
-			return segment, info, nil
+			return segment, nil
 		}
 		if !errors.Is(err, ErrSegmentNotFound) {
-			return nil, nil, err
+			return nil, err
 		}
 
 		s.mu.Lock()
@@ -2010,21 +2047,21 @@ func (s *TranscodeSession) WaitForOpenSegment(name string, timeout time.Duration
 		if restarting {
 			select {
 			case <-deadline:
-				return nil, nil, ErrSegmentNotFound
+				return nil, ErrSegmentNotFound
 			case <-time.After(100 * time.Millisecond):
 				continue
 			}
 		}
 		if !running && waitErr != nil {
-			return nil, nil, fmt.Errorf("%w: %w", ErrTranscodeFailed, waitErr)
+			return nil, fmt.Errorf("%w: %w", ErrTranscodeFailed, waitErr)
 		}
 		if !running {
-			return nil, nil, ErrSegmentNotFound
+			return nil, ErrSegmentNotFound
 		}
 
 		select {
 		case <-deadline:
-			return nil, nil, ErrSegmentNotFound
+			return nil, ErrSegmentNotFound
 		case <-time.After(100 * time.Millisecond):
 		}
 	}

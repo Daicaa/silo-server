@@ -1,9 +1,11 @@
 package playback
 
 import (
+	"errors"
 	"io"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -101,6 +103,63 @@ func TestPruningContinuesAcrossBoundedBatches(t *testing.T) {
 	}
 }
 
+func TestCopyRetentionUsesManifestDurations(t *testing.T) {
+	dir := t.TempDir()
+	old := time.Now().Add(-time.Minute)
+	opts := TranscodeOpts{
+		SessionID:               "copy-duration-test",
+		SourceVideoCodec:        "h264",
+		TargetCodecVideo:        "copy",
+		SegmentDuration:         2,
+		SegmentRetentionSeconds: 10,
+	}
+	manifest := strings.Join([]string{
+		"#EXTM3U",
+		"#EXT-X-VERSION:7",
+		"#EXT-X-MEDIA-SEQUENCE:8",
+		"#EXTINF:1.0,",
+		"seg_00008.m4s",
+		"#EXTINF:2.0,",
+		"seg_00009.m4s",
+		"#EXTINF:3.0,",
+		"seg_00010.m4s",
+		"#EXTINF:4.0,",
+		"seg_00011.m4s",
+		"#EXTINF:5.0,",
+		"seg_00012.m4s",
+		"#EXTINF:6.0,",
+		"seg_00013.m4s",
+		"#EXTINF:7.0,",
+		"seg_00014.m4s",
+		"#EXTINF:8.0,",
+		"seg_00015.m4s",
+		"",
+	}, "\n")
+	writePrunerTestFile(t, filepath.Join(dir, "stream.m3u8"), []byte(manifest), old)
+	for segment := 8; segment <= 15; segment++ {
+		writePrunerTestFile(t, filepath.Join(dir, segmentFilename(segment, opts)), []byte("segment"), old)
+	}
+
+	session := &TranscodeSession{
+		opts:                 opts,
+		outputDir:            dir,
+		lastPruneFloor:       -1,
+		lastRequestedSegment: 0,
+	}
+	session.ReportSegmentDownloaded(15)
+	waitForPrunerFileMissing(t, filepath.Join(dir, segmentFilename(12, opts)))
+	t.Cleanup(func() {
+		session.mu.Lock()
+		session.segmentGeneration++
+		session.segmentPruneRunning = false
+		session.mu.Unlock()
+	})
+
+	assertPrunerFileExists(t, filepath.Join(dir, segmentFilename(13, opts)))
+	assertPrunerFileExists(t, filepath.Join(dir, segmentFilename(14, opts)))
+	assertPrunerFileExists(t, filepath.Join(dir, segmentFilename(15, opts)))
+}
+
 func TestReportSegmentDownloadedDisabledKeepsSegments(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, segmentFilename(3, TranscodeOpts{}))
@@ -159,7 +218,7 @@ func TestOpenSegmentDescriptorSurvivesUnlink(t *testing.T) {
 	writePrunerTestFile(t, path, want, time.Now())
 	session := &TranscodeSession{outputDir: dir}
 
-	segment, _, err := session.OpenSegment("seg_00001.ts")
+	segment, err := session.OpenSegment("seg_00001.ts")
 	if err != nil {
 		t.Fatalf("OpenSegment: %v", err)
 	}
@@ -167,12 +226,42 @@ func TestOpenSegmentDescriptorSurvivesUnlink(t *testing.T) {
 	if err := os.Remove(path); err != nil {
 		t.Fatalf("remove opened segment: %v", err)
 	}
-	got, err := io.ReadAll(segment)
+	got, err := io.ReadAll(segment.File)
 	if err != nil {
 		t.Fatalf("read opened segment: %v", err)
 	}
 	if string(got) != string(want) {
 		t.Fatalf("opened segment = %q, want %q", got, want)
+	}
+}
+
+func TestOpenSegmentLeaseCapturesGeneration(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "seg_00001.ts")
+	writePrunerTestFile(t, path, []byte("complete segment"), time.Now())
+	session := &TranscodeSession{outputDir: dir, segmentGeneration: 7}
+
+	segment, err := session.OpenSegment("seg_00001.ts")
+	if err != nil {
+		t.Fatalf("OpenSegment: %v", err)
+	}
+	defer func() { _ = segment.Close() }()
+	if segment.Generation != 7 {
+		t.Fatalf("segment generation = %d, want 7", segment.Generation)
+	}
+}
+
+func TestOpenSegmentWaitsThroughRestartInsteadOfLeasingStaleFile(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "seg_00001.ts")
+	writePrunerTestFile(t, path, []byte("stale segment"), time.Now())
+	session := &TranscodeSession{outputDir: dir, restarting: true}
+
+	if segment, err := session.OpenSegment("seg_00001.ts"); !errors.Is(err, ErrSegmentNotFound) {
+		if segment != nil {
+			_ = segment.Close()
+		}
+		t.Fatalf("OpenSegment error = %v, want ErrSegmentNotFound", err)
 	}
 }
 

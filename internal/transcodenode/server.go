@@ -894,8 +894,7 @@ func (s *Server) handleSegment(w http.ResponseWriter, r *http.Request) {
 		s.touchSession(sessionID)
 	}
 
-	downloadGeneration := session.SegmentGeneration()
-	segment, segmentInfo, err := session.OpenSegment(name)
+	segmentLease, err := session.OpenSegment(name)
 	if err != nil && err == playback.ErrSegmentNotFound {
 		segNum, parseErr := playback.ParseSegmentNumber(name)
 		if parseErr == nil {
@@ -930,7 +929,7 @@ func (s *Server) handleSegment(w http.ResponseWriter, r *http.Request) {
 					"session", sessionID,
 					"playback_session_id", sessionID,
 				)
-				segment, segmentInfo, err = session.WaitForOpenSegment(name, decision.WaitTimeout)
+				segmentLease, err = session.WaitForOpenSegment(name, decision.WaitTimeout)
 				if err != nil && err == playback.ErrSegmentNotFound {
 					slog.InfoContext(r.Context(), "transcode segment wait timeout", "component", "transcodenode",
 						"segment", name,
@@ -975,7 +974,7 @@ func (s *Server) handleSegment(w http.ResponseWriter, r *http.Request) {
 						seekSeconds,
 						segNum,
 					); restartErr == nil {
-						segment, segmentInfo, err = session.WaitForOpenSegment(name, 30*time.Second)
+						segmentLease, err = session.WaitForOpenSegment(name, 30*time.Second)
 					}
 				}
 				if !ok && session.IsCopyVideo() {
@@ -985,7 +984,7 @@ func (s *Server) handleSegment(w http.ResponseWriter, r *http.Request) {
 		} else if session.IsRunning() {
 			// Non-numbered segment (e.g., init.mp4 for fMP4 HLS).
 			// Wait briefly — the init segment is written almost immediately.
-			segment, segmentInfo, err = session.WaitForOpenSegment(name, 10*time.Second)
+			segmentLease, err = session.WaitForOpenSegment(name, 10*time.Second)
 		}
 	}
 	if err != nil {
@@ -995,13 +994,13 @@ func (s *Server) handleSegment(w http.ResponseWriter, r *http.Request) {
 
 	w.Header().Set("Cache-Control", "no-store, max-age=0")
 	w.Header().Set("Pragma", "no-cache")
-	defer func() { _ = segment.Close() }()
+	defer func() { _ = segmentLease.Close() }()
 	sw := httpstream.NewRollingDeadlineWriter(w)
-	http.ServeContent(sw, r, segmentInfo.Name(), segmentInfo.ModTime(), segment)
+	http.ServeContent(sw, r, segmentLease.Info.Name(), segmentLease.Info.ModTime(), segmentLease.File)
 	if r.Method == http.MethodGet &&
-		sw.CompletedFullResponse(r.Context(), segmentInfo.Size()) {
+		sw.CompletedFullResponse(r.Context(), segmentLease.Info.Size()) {
 		if segmentNumber, parseErr := playback.ParseSegmentNumber(name); parseErr == nil {
-			session.ReportSegmentDownloadedForGeneration(segmentNumber, downloadGeneration)
+			session.ReportSegmentDownloadedForGeneration(segmentNumber, segmentLease.Generation)
 		}
 	}
 }

@@ -417,8 +417,7 @@ func (h *PlaybackHandler) HandleHLSSegment(w http.ResponseWriter, r *http.Reques
 	}
 
 	segmentName := name + "." + ext
-	downloadGeneration := transcodeSession.SegmentGeneration()
-	segment, segmentInfo, err := transcodeSession.OpenSegment(segmentName)
+	segmentLease, err := transcodeSession.OpenSegment(segmentName)
 	if err != nil && errors.Is(err, playback.ErrSegmentNotFound) {
 		segNum, parseErr := playback.ParseSegmentNumber(name)
 		if parseErr == nil {
@@ -455,7 +454,7 @@ func (h *PlaybackHandler) HandleHLSSegment(w http.ResponseWriter, r *http.Reques
 					"session", playSession.UpstreamSessionID,
 					"playback_session_id", playSession.UpstreamSessionID,
 				)
-				segment, segmentInfo, err = transcodeSession.WaitForOpenSegment(segmentName, decision.WaitTimeout)
+				segmentLease, err = transcodeSession.WaitForOpenSegment(segmentName, decision.WaitTimeout)
 				if err != nil && errors.Is(err, playback.ErrSegmentNotFound) {
 					slog.InfoContext(r.Context(), "transcode segment wait timeout", "component", "jellycompat",
 						"segment", segmentName,
@@ -518,14 +517,14 @@ func (h *PlaybackHandler) HandleHLSSegment(w http.ResponseWriter, r *http.Reques
 						seekSeconds,
 						segNum,
 					); restartErr == nil {
-						segment, segmentInfo, err = transcodeSession.WaitForOpenSegment(segmentName, 30*time.Second)
+						segmentLease, err = transcodeSession.WaitForOpenSegment(segmentName, 30*time.Second)
 					}
 				}
 			}
 		} else if transcodeSession.IsRunning() {
 			// Non-numbered segment (e.g. init.mp4 for fMP4 HLS).
 			// Wait briefly — the init segment is written almost immediately.
-			segment, segmentInfo, err = transcodeSession.WaitForOpenSegment(segmentName, 10*time.Second)
+			segmentLease, err = transcodeSession.WaitForOpenSegment(segmentName, 10*time.Second)
 		}
 	}
 	if err != nil {
@@ -534,13 +533,13 @@ func (h *PlaybackHandler) HandleHLSSegment(w http.ResponseWriter, r *http.Reques
 		return
 	}
 
-	defer func() { _ = segment.Close() }()
+	defer func() { _ = segmentLease.Close() }()
 	sw := httpstream.NewRollingDeadlineWriter(w)
-	http.ServeContent(sw, r, segmentInfo.Name(), segmentInfo.ModTime(), segment)
+	http.ServeContent(sw, r, segmentLease.Info.Name(), segmentLease.Info.ModTime(), segmentLease.File)
 	if r.Method == http.MethodGet &&
-		sw.CompletedFullResponse(r.Context(), segmentInfo.Size()) {
+		sw.CompletedFullResponse(r.Context(), segmentLease.Info.Size()) {
 		if segNum, parseErr := playback.ParseSegmentNumber(name); parseErr == nil {
-			transcodeSession.ReportSegmentDownloadedForGeneration(segNum, downloadGeneration)
+			transcodeSession.ReportSegmentDownloadedForGeneration(segNum, segmentLease.Generation)
 		}
 	}
 }

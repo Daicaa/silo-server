@@ -2,9 +2,11 @@ package playback
 
 import (
 	"errors"
+	"fmt"
 	"log/slog"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 )
 
@@ -23,19 +25,32 @@ func (s *TranscodeSession) scheduleSegmentPruneLocked() {
 	if retentionSeconds <= 0 || s.segmentPruneRunning || s.restarting {
 		return
 	}
-	segmentDuration := s.opts.SegmentDuration
-	if segmentDuration <= 0 {
-		segmentDuration = defaultSegmentDuration
-	}
-	retainedSegments := (retentionSeconds + segmentDuration - 1) / segmentDuration
-	floor := s.lastRequestedSegment - retainedSegments
-	if floor <= s.opts.StartSegmentNumber || floor-s.lastPruneFloor < segmentPruneHysteresis {
-		return
+
+	if strings.EqualFold(s.opts.TargetCodecVideo, "copy") {
+		// Copy-mode fragments follow source keyframes, so their real media-time
+		// floor is resolved asynchronously from EXTINF durations below. Use the
+		// download high-water mark only to avoid reparsing the manifest for every
+		// segment response.
+		if s.lastRequestedSegment-s.lastPruneHighWater < segmentPruneHysteresis {
+			return
+		}
+	} else {
+		segmentDuration := s.opts.SegmentDuration
+		if segmentDuration <= 0 {
+			segmentDuration = defaultSegmentDuration
+		}
+		retainedSegments := (retentionSeconds + segmentDuration - 1) / segmentDuration
+		floor := s.lastRequestedSegment - retainedSegments
+		if floor <= s.opts.StartSegmentNumber || floor-s.lastPruneFloor < segmentPruneHysteresis {
+			return
+		}
 	}
 
 	s.segmentPruneRunning = true
 	generation := s.segmentGeneration
-	go s.pruneDownloadedSegments(generation, floor)
+	downloadedThrough := s.lastRequestedSegment
+	s.lastPruneHighWater = downloadedThrough
+	go s.pruneDownloadedSegments(generation, downloadedThrough, false)
 }
 
 // pruneDownloadedSegments removes completed media files strictly behind floor.
@@ -43,7 +58,7 @@ func (s *TranscodeSession) scheduleSegmentPruneLocked() {
 // avoiding repeated full-directory scans when FFmpeg has generated far ahead
 // of the client. The current process's startup window remains present so real
 // manifest reloads cannot get stuck behind startupFilesReady after cleanup.
-func (s *TranscodeSession) pruneDownloadedSegments(generation uint64, floor int) {
+func (s *TranscodeSession) pruneDownloadedSegments(generation uint64, downloadedThrough int, continuation bool) {
 	started := time.Now()
 	s.mu.Lock()
 	if generation != s.segmentGeneration || s.restarting {
@@ -55,6 +70,17 @@ func (s *TranscodeSession) pruneDownloadedSegments(generation uint64, floor int)
 	fromFloor := s.lastPruneFloor
 	s.mu.Unlock()
 
+	floor, complete, err := segmentRetentionFloor(outputDir, opts, downloadedThrough)
+	if err != nil {
+		slog.Warn("resolve transcode segment retention floor", "component", "playback", "error", err, "session", opts.SessionID, "playback_session_id", opts.SessionID)
+		s.finishSegmentPrune(generation, fromFloor, fromFloor, downloadedThrough, segmentPruneRetryDelay)
+		return
+	}
+	if !complete || floor <= opts.StartSegmentNumber || (!continuation && floor-fromFloor < segmentPruneHysteresis) {
+		s.finishSegmentPruneAttempt(generation)
+		return
+	}
+
 	segmentDuration := opts.SegmentDuration
 	if segmentDuration <= 0 {
 		segmentDuration = defaultSegmentDuration
@@ -64,17 +90,17 @@ func (s *TranscodeSession) pruneDownloadedSegments(generation uint64, floor int)
 	fromSegment := max(fromFloor, startupEnd)
 	toSegment := min(floor, fromSegment+segmentPruneBatchSize)
 	if fromSegment >= toSegment {
-		s.finishSegmentPrune(generation, floor, floor, 0)
+		s.finishSegmentPrune(generation, floor, floor, downloadedThrough, 0)
 		return
 	}
 
 	if _, err := os.Stat(outputDir); err != nil {
 		if errors.Is(err, os.ErrNotExist) {
-			s.finishSegmentPrune(generation, toSegment, floor, 0)
+			s.finishSegmentPrune(generation, toSegment, floor, downloadedThrough, 0)
 			return
 		}
 		slog.Warn("stat transcode directory for pruning", "component", "playback", "error", err, "session", opts.SessionID, "playback_session_id", opts.SessionID)
-		s.finishSegmentPrune(generation, fromSegment, floor, segmentPruneRetryDelay)
+		s.finishSegmentPrune(generation, fromSegment, floor, downloadedThrough, segmentPruneRetryDelay)
 		return
 	}
 
@@ -120,7 +146,7 @@ func (s *TranscodeSession) pruneDownloadedSegments(generation uint64, floor int)
 		freedBytes += info.Size()
 	}
 
-	s.finishSegmentPrune(generation, processedFloor, floor, retryAfter)
+	s.finishSegmentPrune(generation, processedFloor, floor, downloadedThrough, retryAfter)
 	if removed > 0 {
 		slog.Info("pruned downloaded transcode segments",
 			"component", "playback",
@@ -134,6 +160,60 @@ func (s *TranscodeSession) pruneDownloadedSegments(generation uint64, floor int)
 	}
 }
 
+// segmentRetentionFloor returns the first segment that must remain to preserve
+// the configured media-time window behind downloadedThrough. Encoded HLS uses
+// fixed-duration fragments. Copy HLS follows source keyframes, so its floor is
+// derived from the current manifest's actual EXTINF durations. complete is
+// false when the manifest does not yet cover the full requested back buffer.
+func segmentRetentionFloor(outputDir string, opts TranscodeOpts, downloadedThrough int) (floor int, complete bool, err error) {
+	retentionSeconds := opts.SegmentRetentionSeconds
+	if retentionSeconds <= 0 {
+		return 0, false, nil
+	}
+
+	if !strings.EqualFold(opts.TargetCodecVideo, "copy") {
+		segmentDuration := opts.SegmentDuration
+		if segmentDuration <= 0 {
+			segmentDuration = defaultSegmentDuration
+		}
+		retainedSegments := (retentionSeconds + segmentDuration - 1) / segmentDuration
+		return downloadedThrough - retainedSegments, true, nil
+	}
+
+	manifest, err := os.ReadFile(filepath.Join(outputDir, "stream.m3u8"))
+	if err != nil {
+		return 0, false, fmt.Errorf("read copy manifest: %w", err)
+	}
+	timeline, err := parseManifestTimeline(manifest)
+	if err != nil {
+		return 0, false, fmt.Errorf("parse copy manifest: %w", err)
+	}
+
+	downloadedIndex := -1
+	for i, entry := range timeline.entries {
+		if entry.duration <= 0 {
+			return 0, false, fmt.Errorf("copy segment %d has non-positive duration %.6f", entry.number, entry.duration)
+		}
+		if entry.number == downloadedThrough {
+			downloadedIndex = i
+		}
+	}
+	if downloadedIndex < 0 {
+		return 0, false, nil
+	}
+
+	floor = downloadedThrough
+	retainedSeconds := 0.0
+	for i := downloadedIndex - 1; i >= 0; i-- {
+		floor = timeline.entries[i].number
+		retainedSeconds += timeline.entries[i].duration
+		if retainedSeconds >= float64(retentionSeconds) {
+			return floor, true, nil
+		}
+	}
+	return 0, false, nil
+}
+
 func earlierPruneRetry(currentFloor int, currentDelay time.Duration, segment int, delay time.Duration) (int, time.Duration) {
 	if segment < currentFloor {
 		return segment, max(delay, time.Millisecond)
@@ -141,7 +221,23 @@ func earlierPruneRetry(currentFloor int, currentDelay time.Duration, segment int
 	return currentFloor, currentDelay
 }
 
-func (s *TranscodeSession) finishSegmentPrune(generation uint64, processedFloor, targetFloor int, retryAfter time.Duration) {
+func (s *TranscodeSession) finishSegmentPruneAttempt(generation uint64) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if generation != s.segmentGeneration {
+		return
+	}
+	s.segmentPruneRunning = false
+	s.scheduleSegmentPruneLocked()
+}
+
+func (s *TranscodeSession) finishSegmentPrune(
+	generation uint64,
+	processedFloor int,
+	targetFloor int,
+	downloadedThrough int,
+	retryAfter time.Duration,
+) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if generation != s.segmentGeneration {
@@ -158,8 +254,12 @@ func (s *TranscodeSession) finishSegmentPrune(generation uint64, processedFloor,
 				return
 			}
 			s.mu.Unlock()
-			go s.pruneDownloadedSegments(generation, targetFloor)
+			go s.pruneDownloadedSegments(generation, downloadedThrough, true)
 		})
+		return
+	}
+	if processedFloor < targetFloor {
+		go s.pruneDownloadedSegments(generation, downloadedThrough, true)
 		return
 	}
 	s.segmentPruneRunning = false
