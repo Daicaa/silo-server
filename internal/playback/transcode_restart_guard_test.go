@@ -16,9 +16,13 @@ func TestForwardRestartPreservesConfiguredBackBuffer(t *testing.T) {
 	}
 
 	dir := t.TempDir()
+	old := time.Now().Add(-time.Minute)
 	for _, segment := range []int{3, 40, 64, 65, 69, 70, 100} {
 		name := filepath.Join(dir, segmentFilename(segment, TranscodeOpts{}))
 		if err := os.WriteFile(name, []byte("segment"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Chtimes(name, old, old); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -49,6 +53,15 @@ func TestForwardRestartPreservesConfiguredBackBuffer(t *testing.T) {
 		if _, err := os.Stat(path); err != nil {
 			t.Errorf("retained segment %d was removed: %v", segment, err)
 		}
+	}
+
+	// Once the replacement generation has produced a complete back buffer,
+	// the preserved range must become eligible again rather than leaking one
+	// full window after every forward seek.
+	session.ReportSegmentDownloaded(105)
+	waitForPrunerFileMissing(t, filepath.Join(dir, segmentFilename(70, TranscodeOpts{})))
+	if _, err := os.Stat(filepath.Join(dir, segmentFilename(100, TranscodeOpts{}))); err != nil {
+		t.Fatalf("replacement startup segment was removed: %v", err)
 	}
 }
 

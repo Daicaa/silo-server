@@ -41,7 +41,8 @@ func (s *TranscodeSession) scheduleSegmentPruneLocked() {
 		}
 		retainedSegments := (retentionSeconds + segmentDuration - 1) / segmentDuration
 		floor := s.lastRequestedSegment - retainedSegments
-		if floor <= s.opts.StartSegmentNumber || floor-s.lastPruneFloor < segmentPruneHysteresis {
+		beforeStartReady := s.pruneBeforeStart && floor == s.opts.StartSegmentNumber
+		if floor < s.opts.StartSegmentNumber || (!beforeStartReady && floor == s.opts.StartSegmentNumber) || floor-s.lastPruneFloor < segmentPruneHysteresis {
 			return
 		}
 	}
@@ -68,6 +69,7 @@ func (s *TranscodeSession) pruneDownloadedSegments(generation uint64, downloaded
 	opts := s.opts
 	outputDir := s.outputDir
 	fromFloor := s.lastPruneFloor
+	pruneBeforeStart := s.pruneBeforeStart
 	s.mu.Unlock()
 
 	floor, complete, err := segmentRetentionFloor(outputDir, opts, downloadedThrough)
@@ -76,7 +78,8 @@ func (s *TranscodeSession) pruneDownloadedSegments(generation uint64, downloaded
 		s.finishSegmentPrune(generation, fromFloor, fromFloor, downloadedThrough, segmentPruneRetryDelay)
 		return
 	}
-	if !complete || floor <= opts.StartSegmentNumber || (!continuation && floor-fromFloor < segmentPruneHysteresis) {
+	beforeStartReady := pruneBeforeStart && floor == opts.StartSegmentNumber
+	if !complete || floor < opts.StartSegmentNumber || (!beforeStartReady && floor == opts.StartSegmentNumber) || (!continuation && floor-fromFloor < segmentPruneHysteresis) {
 		s.finishSegmentPruneAttempt(generation)
 		return
 	}
@@ -87,20 +90,29 @@ func (s *TranscodeSession) pruneDownloadedSegments(generation uint64, downloaded
 	}
 	freshGuard := 2*time.Duration(segmentDuration)*time.Second + 30*time.Second
 	startupEnd := opts.StartSegmentNumber + startupSegmentRequirement(opts)
+	targetFloor := floor
 	fromSegment := max(fromFloor, startupEnd)
-	toSegment := min(floor, fromSegment+segmentPruneBatchSize)
+	if pruneBeforeStart {
+		// A forward restart intentionally keeps the previous generation's back
+		// buffer until the replacement has produced its own. Retire that older
+		// range first, including its startup files, then resume normal pruning
+		// without touching the replacement process's startup window.
+		fromSegment = max(fromFloor, 0)
+		targetFloor = min(floor, opts.StartSegmentNumber)
+	}
+	toSegment := min(targetFloor, fromSegment+segmentPruneBatchSize)
 	if fromSegment >= toSegment {
-		s.finishSegmentPrune(generation, floor, floor, downloadedThrough, 0)
+		s.finishSegmentPrune(generation, targetFloor, targetFloor, downloadedThrough, 0)
 		return
 	}
 
 	if _, err := os.Stat(outputDir); err != nil {
 		if errors.Is(err, os.ErrNotExist) {
-			s.finishSegmentPrune(generation, toSegment, floor, downloadedThrough, 0)
+			s.finishSegmentPrune(generation, toSegment, targetFloor, downloadedThrough, 0)
 			return
 		}
 		slog.Warn("stat transcode directory for pruning", "component", "playback", "error", err, "session", opts.SessionID, "playback_session_id", opts.SessionID)
-		s.finishSegmentPrune(generation, fromSegment, floor, downloadedThrough, segmentPruneRetryDelay)
+		s.finishSegmentPrune(generation, fromSegment, targetFloor, downloadedThrough, segmentPruneRetryDelay)
 		return
 	}
 
@@ -146,7 +158,7 @@ func (s *TranscodeSession) pruneDownloadedSegments(generation uint64, downloaded
 		freedBytes += info.Size()
 	}
 
-	s.finishSegmentPrune(generation, processedFloor, floor, downloadedThrough, retryAfter)
+	s.finishSegmentPrune(generation, processedFloor, targetFloor, downloadedThrough, retryAfter)
 	if removed > 0 {
 		slog.Info("pruned downloaded transcode segments",
 			"component", "playback",
@@ -244,6 +256,9 @@ func (s *TranscodeSession) finishSegmentPrune(
 	}
 	if processedFloor > s.lastPruneFloor {
 		s.lastPruneFloor = processedFloor
+	}
+	if s.pruneBeforeStart && s.lastPruneFloor >= s.opts.StartSegmentNumber {
+		s.pruneBeforeStart = false
 	}
 	if retryAfter > 0 {
 		time.AfterFunc(retryAfter, func() {

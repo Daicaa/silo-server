@@ -123,6 +123,7 @@ type TranscodeSession struct {
 	lastPruneFloor       int
 	lastPruneHighWater   int
 	segmentPruneRunning  bool
+	pruneBeforeStart     bool
 	segmentGeneration    uint64
 	throttler            *TranscodeThrottler
 	stderrLinesLogged    int
@@ -2065,7 +2066,8 @@ func (s *TranscodeSession) cleanSkippedSegments(downloadedThrough int, opts Tran
 	startupEnd := opts.StartSegmentNumber + startupSegmentRequirement(opts)
 	for _, entry := range entries {
 		segNum, parseErr := ParseSegmentNumber(entry.Name())
-		if parseErr != nil || segNum < startupEnd || segNum >= floor {
+		inStartupWindow := segNum >= opts.StartSegmentNumber && segNum < startupEnd
+		if parseErr != nil || inStartupWindow || segNum >= floor {
 			continue
 		}
 		if removeErr := os.Remove(filepath.Join(s.outputDir, entry.Name())); removeErr != nil && !errors.Is(removeErr, os.ErrNotExist) {
@@ -2116,8 +2118,17 @@ func (s *TranscodeSession) restart(
 	s.segmentGeneration++
 	s.segmentPruneRunning = false
 	previousRequestedSegment := s.lastRequestedSegment
+	forwardRestart := startSegment > previousRequestedSegment
 	s.lastRequestedSegment = startSegment
-	s.lastPruneFloor = startSegment - 1
+	if forwardRestart && s.opts.SegmentRetentionSeconds > 0 {
+		// Keep the old prune cursor reachable until the replacement process has
+		// produced a complete back buffer. Otherwise every forward restart leaves
+		// one retained window permanently behind startSegment.
+		s.pruneBeforeStart = true
+	} else {
+		s.lastPruneFloor = startSegment - 1
+		s.pruneBeforeStart = false
+	}
 	s.lastPruneHighWater = startSegment
 	cancelCurrent := s.cancel
 	done := s.done
@@ -2143,7 +2154,7 @@ func (s *TranscodeSession) restart(
 	reserveHWDevice := s.reserveHWDeviceOnRestart
 	s.mu.Unlock()
 
-	if startSegment > previousRequestedSegment {
+	if forwardRestart {
 		s.cleanSkippedSegments(previousRequestedSegment, opts)
 	}
 
