@@ -20,6 +20,7 @@ import (
 	"time"
 
 	"github.com/Silo-Server/silo-server/internal/models"
+	"github.com/google/uuid"
 )
 
 func init() {
@@ -104,6 +105,14 @@ const (
 	transcodeHWQSV     = "qsv"
 	transcodeHWVAAPI   = "vaapi"
 	transcodeHWNVENC   = "nvenc"
+
+	// TranscodeProxyRequestHeader marks a segment hop whose immediate HTTP
+	// consumer is the central API rather than the playback client. The node
+	// defers download accounting until the API confirms downstream completion.
+	TranscodeProxyRequestHeader = "X-Silo-Transcode-Proxy"
+	// TranscodeSegmentGenerationHeader binds that downstream acknowledgement to
+	// the exact FFmpeg timeline whose segment descriptor the node served.
+	TranscodeSegmentGenerationHeader = "X-Silo-Transcode-Segment-Generation"
 )
 
 // TranscodeSession manages a running ffmpeg HLS transcode process.
@@ -120,11 +129,13 @@ type TranscodeSession struct {
 	done                 chan struct{} // closed when the monitor goroutine finishes
 	stdinPipe            io.WriteCloser
 	lastRequestedSegment int
+	lastCompletedSegment int
 	lastPruneFloor       int
 	lastPruneHighWater   int
 	segmentPruneRunning  bool
 	pruneBeforeStart     bool
 	segmentGeneration    uint64
+	segmentIncarnation   string
 	throttler            *TranscodeThrottler
 	stderrLinesLogged    int
 	stderrBytesLogged    int
@@ -252,8 +263,10 @@ func StartTranscode(ctx context.Context, opts TranscodeOpts) (*TranscodeSession,
 		done:                     make(chan struct{}),
 		stderr:                   newBoundedTailBuffer(stderrTailMaxBytes),
 		lastRequestedSegment:     opts.StartSegmentNumber,
+		lastCompletedSegment:     opts.StartSegmentNumber - 1,
 		lastPruneFloor:           opts.StartSegmentNumber - 1,
-		lastPruneHighWater:       opts.StartSegmentNumber,
+		lastPruneHighWater:       opts.StartSegmentNumber - 1,
+		segmentIncarnation:       uuid.NewString(),
 		reserveHWDeviceOnRestart: reserveHWDeviceOnRestart,
 	}
 
@@ -1891,9 +1904,10 @@ func (s *TranscodeSession) GetSegment(name string) (string, error) {
 // concurrent prune may unlink the directory entry, but the response can still
 // read the complete file on POSIX filesystems.
 type SegmentLease struct {
-	File       *os.File
-	Info       os.FileInfo
-	Generation uint64
+	File            *os.File
+	Info            os.FileInfo
+	Generation      uint64
+	GenerationToken string
 }
 
 // Close releases the opened segment descriptor.
@@ -1927,7 +1941,15 @@ func (s *TranscodeSession) OpenSegment(name string) (*SegmentLease, error) {
 		_ = segment.Close()
 		return nil, ErrSegmentNotFound
 	}
-	return &SegmentLease{File: segment, Info: info, Generation: s.segmentGeneration}, nil
+	if s.segmentIncarnation == "" {
+		s.segmentIncarnation = uuid.NewString()
+	}
+	return &SegmentLease{
+		File:            segment,
+		Info:            info,
+		Generation:      s.segmentGeneration,
+		GenerationToken: s.segmentGenerationTokenLocked(),
+	}, nil
 }
 
 // Close terminates the ffmpeg process and removes the temporary output directory.
@@ -2042,40 +2064,6 @@ func (s *TranscodeSession) cleanStaleSegments(startSegment int) {
 	}
 }
 
-// cleanSkippedSegments removes media older than the retained window before a
-// forward restart. The configured back buffer and the current process's startup
-// files remain available for immediate backward recovery.
-func (s *TranscodeSession) cleanSkippedSegments(downloadedThrough int, opts TranscodeOpts) {
-	if opts.SegmentRetentionSeconds <= 0 {
-		return
-	}
-	floor, complete, err := segmentRetentionFloor(s.outputDir, opts, downloadedThrough)
-	if err != nil {
-		slog.Warn("resolve skipped transcode retention floor", "component", "playback", "error", err, "session", opts.SessionID, "playback_session_id", opts.SessionID)
-		return
-	}
-	if !complete {
-		return
-	}
-
-	entries, err := os.ReadDir(s.outputDir)
-	if err != nil {
-		slog.Warn("read transcode directory for skipped cleanup", "component", "playback", "error", err, "session", opts.SessionID, "playback_session_id", opts.SessionID)
-		return
-	}
-	startupEnd := opts.StartSegmentNumber + startupSegmentRequirement(opts)
-	for _, entry := range entries {
-		segNum, parseErr := ParseSegmentNumber(entry.Name())
-		inStartupWindow := segNum >= opts.StartSegmentNumber && segNum < startupEnd
-		if parseErr != nil || inStartupWindow || segNum >= floor {
-			continue
-		}
-		if removeErr := os.Remove(filepath.Join(s.outputDir, entry.Name())); removeErr != nil && !errors.Is(removeErr, os.ErrNotExist) {
-			slog.Warn("remove skipped transcode segment", "component", "playback", "error", removeErr, "segment", segNum, "session", opts.SessionID, "playback_session_id", opts.SessionID)
-		}
-	}
-}
-
 // Restart kills the current ffmpeg process and starts a new one seeking to
 // the given position. startSegment sets -hls_segment_start_number so that
 // output filenames align with the expected segment numbering. Existing
@@ -2120,6 +2108,7 @@ func (s *TranscodeSession) restart(
 	previousRequestedSegment := s.lastRequestedSegment
 	forwardRestart := startSegment > previousRequestedSegment
 	s.lastRequestedSegment = startSegment
+	s.lastCompletedSegment = startSegment - 1
 	if forwardRestart && s.opts.SegmentRetentionSeconds > 0 {
 		// Keep the old prune cursor reachable until the replacement process has
 		// produced a complete back buffer. Otherwise every forward restart leaves
@@ -2129,7 +2118,7 @@ func (s *TranscodeSession) restart(
 		s.lastPruneFloor = startSegment - 1
 		s.pruneBeforeStart = false
 	}
-	s.lastPruneHighWater = startSegment
+	s.lastPruneHighWater = startSegment - 1
 	cancelCurrent := s.cancel
 	done := s.done
 	s.mu.Unlock()
@@ -2153,10 +2142,6 @@ func (s *TranscodeSession) restart(
 	opts := s.opts
 	reserveHWDevice := s.reserveHWDeviceOnRestart
 	s.mu.Unlock()
-
-	if forwardRestart {
-		s.cleanSkippedSegments(previousRequestedSegment, opts)
-	}
 
 	// Copy-mode restarts must clean stale segments so ffmpeg writes fresh
 	// output. Encoded transcodes keep old segments for backward seek reuse.
@@ -2230,6 +2215,7 @@ func (s *TranscodeSession) restart(
 	s.restarting = false
 	s.stdinPipe = stdinPipe
 	s.lastRequestedSegment = startSegment
+	s.lastCompletedSegment = startSegment - 1
 	s.done = make(chan struct{})
 	hook := s.restartHook
 	s.mu.Unlock()
@@ -2606,9 +2592,29 @@ func (s *TranscodeSession) ReportSegmentDownloadedForGeneration(segNum int, gene
 	s.reportSegmentDownloadedLocked(segNum)
 }
 
+// ReportSegmentDownloadedForGenerationToken records a completion relayed over
+// HTTP only when it belongs to this exact session object and FFmpeg timeline.
+// The opaque incarnation prevents a delayed proxy acknowledgement from matching
+// a reconstructed session whose numeric generation restarted at zero.
+func (s *TranscodeSession) ReportSegmentDownloadedForGenerationToken(segNum int, generationToken string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if generationToken == "" || generationToken != s.segmentGenerationTokenLocked() {
+		return
+	}
+	s.reportSegmentDownloadedLocked(segNum)
+}
+
+func (s *TranscodeSession) segmentGenerationTokenLocked() string {
+	return s.segmentIncarnation + ":" + strconv.FormatUint(s.segmentGeneration, 10)
+}
+
 func (s *TranscodeSession) reportSegmentDownloadedLocked(segNum int) {
 	if segNum > s.lastRequestedSegment {
 		s.lastRequestedSegment = segNum
+	}
+	if segNum > s.lastCompletedSegment {
+		s.lastCompletedSegment = segNum
 	}
 	s.scheduleSegmentPruneLocked()
 }

@@ -31,7 +31,7 @@ func (s *TranscodeSession) scheduleSegmentPruneLocked() {
 		// floor is resolved asynchronously from EXTINF durations below. Use the
 		// download high-water mark only to avoid reparsing the manifest for every
 		// segment response.
-		if s.lastRequestedSegment-s.lastPruneHighWater < segmentPruneHysteresis {
+		if s.lastCompletedSegment-s.lastPruneHighWater < segmentPruneHysteresis {
 			return
 		}
 	} else {
@@ -40,7 +40,7 @@ func (s *TranscodeSession) scheduleSegmentPruneLocked() {
 			segmentDuration = defaultSegmentDuration
 		}
 		retainedSegments := (retentionSeconds + segmentDuration - 1) / segmentDuration
-		floor := s.lastRequestedSegment - retainedSegments
+		floor := s.lastCompletedSegment - retainedSegments
 		beforeStartReady := s.pruneBeforeStart && floor == s.opts.StartSegmentNumber
 		if floor < s.opts.StartSegmentNumber || (!beforeStartReady && floor == s.opts.StartSegmentNumber) || floor-s.lastPruneFloor < segmentPruneHysteresis {
 			return
@@ -49,7 +49,7 @@ func (s *TranscodeSession) scheduleSegmentPruneLocked() {
 
 	s.segmentPruneRunning = true
 	generation := s.segmentGeneration
-	downloadedThrough := s.lastRequestedSegment
+	downloadedThrough := s.lastCompletedSegment
 	s.lastPruneHighWater = downloadedThrough
 	go s.pruneDownloadedSegments(generation, downloadedThrough, false)
 }

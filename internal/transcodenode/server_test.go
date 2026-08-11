@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -34,9 +35,120 @@ func newTestServer(t *testing.T) *Server {
 	cfg.Playback.TranscodeDir = t.TempDir()
 	w.SetConfigForTest(cfg)
 	return &Server{
-		watcher:  w,
-		sessions: make(map[string]*playback.TranscodeSession),
+		watcher:    w,
+		sessions:   make(map[string]*playback.TranscodeSession),
+		lastAccess: make(map[string]time.Time),
 	}
+}
+
+func TestProxiedSegmentCompletionRequiresDownstreamAcknowledgement(t *testing.T) {
+	truePath, err := exec.LookPath("true")
+	if err != nil {
+		t.Skipf("`true` not found in PATH: %v", err)
+	}
+
+	const sessionID = "proxy-completion-session"
+	server := newTestServer(t)
+	outputDir := t.TempDir()
+	session, err := playback.StartTranscode(context.Background(), playback.TranscodeOpts{
+		SessionID:               sessionID,
+		OutputDir:               outputDir,
+		FFmpegPath:              truePath,
+		TargetCodecVideo:        "h264",
+		TargetCodecAudio:        "aac",
+		SegmentDuration:         2,
+		SegmentRetentionSeconds: 600,
+	})
+	if err != nil {
+		t.Fatalf("StartTranscode: %v", err)
+	}
+	t.Cleanup(func() { _ = session.Close() })
+	server.sessions[sessionID] = session
+	server.lastAccess[sessionID] = time.Now()
+
+	const segmentName = "seg_00007.ts"
+	if err := os.WriteFile(filepath.Join(outputDir, segmentName), []byte("complete segment"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	segmentReq := withNodeRouteParams(
+		httptest.NewRequest(http.MethodGet, "/transcode/"+sessionID+"/segment/"+segmentName, nil),
+		map[string]string{"session_id": sessionID, "name": segmentName},
+	)
+	segmentReq.Header.Set(playback.TranscodeProxyRequestHeader, "1")
+	segmentRR := httptest.NewRecorder()
+	server.handleSegment(segmentRR, segmentReq)
+	if segmentRR.Code != http.StatusOK {
+		t.Fatalf("segment status = %d, body = %q", segmentRR.Code, segmentRR.Body.String())
+	}
+	generation := segmentRR.Header().Get(playback.TranscodeSegmentGenerationHeader)
+	if generation == "" {
+		t.Fatal("proxied segment omitted generation")
+	}
+	if got := session.LastRequestedSegment(); got != 0 {
+		t.Fatalf("node counted proxy-hop completion as client completion: got %d, want 0", got)
+	}
+
+	ackReq := withNodeRouteParams(
+		httptest.NewRequest(http.MethodPost, "/transcode/"+sessionID+"/segment/"+segmentName+"/downloaded", nil),
+		map[string]string{"session_id": sessionID, "name": segmentName},
+	)
+	ackReq.Header.Set(playback.TranscodeSegmentGenerationHeader, generation)
+	ackRR := httptest.NewRecorder()
+	server.handleSegmentDownloaded(ackRR, ackReq)
+	if ackRR.Code != http.StatusNoContent {
+		t.Fatalf("ack status = %d, body = %q", ackRR.Code, ackRR.Body.String())
+	}
+	if got := session.LastRequestedSegment(); got != 7 {
+		t.Fatalf("acknowledged segment = %d, want 7", got)
+	}
+}
+
+func TestProxiedSegmentCompletionRejectsStaleGeneration(t *testing.T) {
+	truePath, err := exec.LookPath("true")
+	if err != nil {
+		t.Skipf("`true` not found in PATH: %v", err)
+	}
+
+	const sessionID = "stale-proxy-completion-session"
+	server := newTestServer(t)
+	session, err := playback.StartTranscode(context.Background(), playback.TranscodeOpts{
+		SessionID:        sessionID,
+		OutputDir:        t.TempDir(),
+		FFmpegPath:       truePath,
+		TargetCodecVideo: "h264",
+		TargetCodecAudio: "aac",
+		SegmentDuration:  2,
+	})
+	if err != nil {
+		t.Fatalf("StartTranscode: %v", err)
+	}
+	t.Cleanup(func() { _ = session.Close() })
+	server.sessions[sessionID] = session
+	server.lastAccess[sessionID] = time.Now()
+
+	const segmentName = "seg_00007.ts"
+	ackReq := withNodeRouteParams(
+		httptest.NewRequest(http.MethodPost, "/transcode/"+sessionID+"/segment/"+segmentName+"/downloaded", nil),
+		map[string]string{"session_id": sessionID, "name": segmentName},
+	)
+	ackReq.Header.Set(playback.TranscodeSegmentGenerationHeader, "999")
+	ackRR := httptest.NewRecorder()
+	server.handleSegmentDownloaded(ackRR, ackReq)
+	if ackRR.Code != http.StatusNoContent {
+		t.Fatalf("ack status = %d, body = %q", ackRR.Code, ackRR.Body.String())
+	}
+	if got := session.LastRequestedSegment(); got != 0 {
+		t.Fatalf("stale acknowledgement advanced segment to %d", got)
+	}
+}
+
+func withNodeRouteParams(req *http.Request, values map[string]string) *http.Request {
+	routeCtx := chi.NewRouteContext()
+	for key, value := range values {
+		routeCtx.URLParams.Add(key, value)
+	}
+	return req.WithContext(context.WithValue(req.Context(), chi.RouteCtxKey, routeCtx))
 }
 
 func TestHandleStartRequireReadyRejectsExitedFFmpeg(t *testing.T) {

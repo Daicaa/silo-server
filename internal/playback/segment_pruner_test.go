@@ -251,6 +251,43 @@ func TestOpenSegmentLeaseCapturesGeneration(t *testing.T) {
 	}
 }
 
+func TestGenerationTokenRejectsPriorSessionIncarnation(t *testing.T) {
+	oldDir := t.TempDir()
+	newDir := t.TempDir()
+	const name = "seg_00007.ts"
+	writePrunerTestFile(t, filepath.Join(oldDir, name), []byte("old segment"), time.Now())
+	writePrunerTestFile(t, filepath.Join(newDir, name), []byte("new segment"), time.Now())
+
+	oldSession := &TranscodeSession{outputDir: oldDir}
+	oldLease, err := oldSession.OpenSegment(name)
+	if err != nil {
+		t.Fatalf("open old segment: %v", err)
+	}
+	defer func() { _ = oldLease.Close() }()
+
+	newSession := &TranscodeSession{outputDir: newDir}
+	newLease, err := newSession.OpenSegment(name)
+	if err != nil {
+		t.Fatalf("open new segment: %v", err)
+	}
+	defer func() { _ = newLease.Close() }()
+	if oldLease.Generation != newLease.Generation {
+		t.Fatalf("numeric generations differ: old=%d new=%d; test requires restart collision", oldLease.Generation, newLease.Generation)
+	}
+	if oldLease.GenerationToken == newLease.GenerationToken {
+		t.Fatal("separate session objects reused an opaque generation token")
+	}
+
+	newSession.ReportSegmentDownloadedForGenerationToken(7, oldLease.GenerationToken)
+	if got := newSession.LastRequestedSegment(); got != 0 {
+		t.Fatalf("prior-session token advanced replacement to %d", got)
+	}
+	newSession.ReportSegmentDownloadedForGenerationToken(7, newLease.GenerationToken)
+	if got := newSession.LastRequestedSegment(); got != 7 {
+		t.Fatalf("current token advanced replacement to %d, want 7", got)
+	}
+}
+
 func TestOpenSegmentWaitsThroughRestartInsteadOfLeasingStaleFile(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "seg_00001.ts")

@@ -1537,6 +1537,9 @@ func (h *PlaybackHandler) buildProxyManifestURL(card playback.RecipeCard, proxyN
 func (h *PlaybackHandler) proxyToTranscodeNode(w http.ResponseWriter, r *http.Request, transcodeNodeURL, path string) {
 	sessionID := chi.URLParam(r, "session_id")
 	targetURL := transcodeNodeURL + path
+	isSegmentRoute := strings.Contains(path, "/segment/")
+	_, segmentParseErr := playback.ParseSegmentNumber(filepath.Base(path))
+	isMediaSegment := segmentParseErr == nil
 	// Capture the signed stream token ("st") before stripping it from the URL.
 	// We forward it out-of-band as a header so the node can reconstruct after a
 	// self-restart, while keeping it out of the forwarded/logged URL.
@@ -1556,6 +1559,19 @@ func (h *PlaybackHandler) proxyToTranscodeNode(w http.ResponseWriter, r *http.Re
 		return
 	}
 	req.Header.Set("Authorization", "Bearer "+h.JWTSecret)
+	if isSegmentRoute {
+		// The node's immediate transport peer is this API process, so receiving a
+		// complete response there does not prove that the browser received it.
+		// Suppress node-local accounting and acknowledge only after the downstream
+		// writer completes. Forward range validators so both hops serve the same
+		// representation.
+		req.Header.Set(playback.TranscodeProxyRequestHeader, "1")
+		for _, name := range []string{"Range", "If-Range", "If-Match", "If-None-Match", "If-Modified-Since", "If-Unmodified-Since"} {
+			for _, value := range r.Header.Values(name) {
+				req.Header.Add(name, value)
+			}
+		}
+	}
 	// Best-effort forward of the stream token as a header so the node's
 	// reconstruct path (X-Silo-Stream-Token) can rebuild after a self-restart.
 	// Verify at the API boundary and confirm it belongs to this session; an
@@ -1579,7 +1595,7 @@ func (h *PlaybackHandler) proxyToTranscodeNode(w http.ResponseWriter, r *http.Re
 		http.Error(w, "transcode node unavailable", http.StatusBadGateway)
 		return
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	// The node strips "st" from the request query (kept out of node URLs/logs),
 	// so the segment/init URIs in the manifest it builds carry no token. Without
@@ -1609,7 +1625,11 @@ func (h *PlaybackHandler) proxyToTranscodeNode(w http.ResponseWriter, r *http.Re
 		return
 	}
 
+	generation := resp.Header.Get(playback.TranscodeSegmentGenerationHeader)
 	for k, vv := range resp.Header {
+		if http.CanonicalHeaderKey(k) == playback.TranscodeSegmentGenerationHeader {
+			continue
+		}
 		for _, v := range vv {
 			w.Header().Add(k, v)
 		}
@@ -1618,7 +1638,64 @@ func (h *PlaybackHandler) proxyToTranscodeNode(w http.ResponseWriter, r *http.Re
 	// WriteTimeout; roll the write deadline with progress instead.
 	sw := httpstream.NewRollingDeadlineWriter(w)
 	sw.WriteHeader(resp.StatusCode)
-	io.Copy(sw, resp.Body)
+	if _, copyErr := io.Copy(sw, resp.Body); copyErr != nil {
+		return
+	}
+	fullSize := proxiedFullRepresentationSize(resp)
+	if isMediaSegment && generation != "" && r.Method == http.MethodGet &&
+		sw.CompletedFullResponse(r.Context(), fullSize) {
+		h.acknowledgeProxiedSegment(r.Context(), transcodeNodeURL, path, sessionID, generation)
+	}
+}
+
+func proxiedFullRepresentationSize(resp *http.Response) int64 {
+	if resp == nil {
+		return -1
+	}
+	if resp.StatusCode == http.StatusOK {
+		return resp.ContentLength
+	}
+	if resp.StatusCode != http.StatusPartialContent {
+		return -1
+	}
+	contentRange := resp.Header.Get("Content-Range")
+	_, total, ok := strings.Cut(contentRange, "/")
+	if !ok || total == "*" {
+		return -1
+	}
+	size, err := strconv.ParseInt(total, 10, 64)
+	if err != nil || size <= 0 {
+		return -1
+	}
+	return size
+}
+
+func (h *PlaybackHandler) acknowledgeProxiedSegment(
+	ctx context.Context,
+	transcodeNodeURL string,
+	path string,
+	sessionID string,
+	generation string,
+) {
+	ackCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ackCtx, http.MethodPost, transcodeNodeURL+path+"/downloaded", nil)
+	if err != nil {
+		slog.WarnContext(ctx, "build transcode segment completion acknowledgement", "component", "api", "error", err, "playback_session_id", sessionID)
+		return
+	}
+	req.Header.Set("Authorization", "Bearer "+h.JWTSecret)
+	req.Header.Set(playback.TranscodeSegmentGenerationHeader, generation)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		slog.WarnContext(ctx, "acknowledge transcode segment completion", "component", "api", "error", err, "playback_session_id", sessionID)
+		return
+	}
+	defer func() { _ = resp.Body.Close() }()
+	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 4<<10))
+	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
+		slog.WarnContext(ctx, "transcode segment completion acknowledgement rejected", "component", "api", "status", resp.StatusCode, "playback_session_id", sessionID)
+	}
 }
 
 // maybeStartThrottler reads throttle settings and starts the throttler if enabled.

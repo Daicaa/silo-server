@@ -29,6 +29,8 @@ func TestForwardRestartPreservesConfiguredBackBuffer(t *testing.T) {
 	session := &TranscodeSession{
 		outputDir:            dir,
 		lastRequestedSegment: 70,
+		lastCompletedSegment: 70,
+		lastPruneFloor:       -1,
 		opts: TranscodeOpts{
 			OutputDir:               dir,
 			TargetCodecVideo:        "h264",
@@ -42,16 +44,12 @@ func TestForwardRestartPreservesConfiguredBackBuffer(t *testing.T) {
 	if err := session.Restart(context.Background(), 400, 100); err != nil {
 		t.Fatalf("Restart: %v", err)
 	}
-	for _, segment := range []int{3, 40, 64} {
-		path := filepath.Join(dir, segmentFilename(segment, TranscodeOpts{}))
-		if _, err := os.Stat(path); !os.IsNotExist(err) {
-			t.Errorf("skipped segment %d survived forward restart: %v", segment, err)
-		}
-	}
-	for _, segment := range []int{65, 69, 70, 100} {
+	// Restart itself has no downstream-completion proof for the replacement
+	// generation, so it must not unlink even old files synchronously.
+	for _, segment := range []int{3, 40, 64, 65, 69, 70, 100} {
 		path := filepath.Join(dir, segmentFilename(segment, TranscodeOpts{}))
 		if _, err := os.Stat(path); err != nil {
-			t.Errorf("retained segment %d was removed: %v", segment, err)
+			t.Errorf("segment %d was removed during restart: %v", segment, err)
 		}
 	}
 
@@ -60,8 +58,52 @@ func TestForwardRestartPreservesConfiguredBackBuffer(t *testing.T) {
 	// full window after every forward seek.
 	session.ReportSegmentDownloaded(105)
 	waitForPrunerFileMissing(t, filepath.Join(dir, segmentFilename(70, TranscodeOpts{})))
+	for _, segment := range []int{3, 40, 64, 65, 69, 70} {
+		path := filepath.Join(dir, segmentFilename(segment, TranscodeOpts{}))
+		if _, err := os.Stat(path); !os.IsNotExist(err) {
+			t.Errorf("expired pre-restart segment %d survived completed-download pruning: %v", segment, err)
+		}
+	}
 	if _, err := os.Stat(filepath.Join(dir, segmentFilename(100, TranscodeOpts{}))); err != nil {
 		t.Fatalf("replacement startup segment was removed: %v", err)
+	}
+}
+
+func TestForwardRestartWithoutCompletedDownloadPreservesFreshFiles(t *testing.T) {
+	truePath, err := exec.LookPath("true")
+	if err != nil {
+		t.Skipf("`true` not found in PATH: %v", err)
+	}
+
+	dir := t.TempDir()
+	for _, segment := range []int{3, 40, 70} {
+		if err := os.WriteFile(filepath.Join(dir, segmentFilename(segment, TranscodeOpts{})), []byte("segment"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	session := &TranscodeSession{
+		outputDir:            dir,
+		lastRequestedSegment: 70,
+		lastCompletedSegment: -1,
+		lastPruneFloor:       -1,
+		opts: TranscodeOpts{
+			OutputDir:               dir,
+			TargetCodecVideo:        "h264",
+			SegmentDuration:         4,
+			SegmentRetentionSeconds: 20,
+			StartSegmentNumber:      0,
+			FFmpegPath:              truePath,
+		},
+	}
+
+	if err := session.Restart(context.Background(), 400, 100); err != nil {
+		t.Fatalf("Restart: %v", err)
+	}
+	time.Sleep(20 * time.Millisecond)
+	for _, segment := range []int{3, 40, 70} {
+		if _, err := os.Stat(filepath.Join(dir, segmentFilename(segment, TranscodeOpts{}))); err != nil {
+			t.Errorf("fresh segment %d was removed without a completed download: %v", segment, err)
+		}
 	}
 }
 
@@ -81,6 +123,7 @@ func TestForwardRestartKeepsSegmentsWhenRetentionDisabled(t *testing.T) {
 	session := &TranscodeSession{
 		outputDir:            dir,
 		lastRequestedSegment: 70,
+		lastCompletedSegment: 70,
 		opts: TranscodeOpts{
 			OutputDir:          dir,
 			TargetCodecVideo:   "h264",

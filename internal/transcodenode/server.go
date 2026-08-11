@@ -388,6 +388,7 @@ func (s *Server) Handler() http.Handler {
 		r.Delete("/transcode/{session_id}", s.handleStop)
 		r.Get("/transcode/{session_id}/master.m3u8", s.handleManifest)
 		r.Get("/transcode/{session_id}/segment/{name}", s.handleSegment)
+		r.Post("/transcode/{session_id}/segment/{name}/downloaded", s.handleSegmentDownloaded)
 		r.Post("/admin/force-reload", s.handleForceReload)
 		r.Get("/status", s.handleStatus)
 	})
@@ -1003,15 +1004,46 @@ func (s *Server) handleSegment(w http.ResponseWriter, r *http.Request) {
 
 	w.Header().Set("Cache-Control", "no-store, max-age=0")
 	w.Header().Set("Pragma", "no-cache")
+	proxied := r.Header.Get(playback.TranscodeProxyRequestHeader) == "1"
+	if proxied {
+		w.Header().Set(playback.TranscodeSegmentGenerationHeader, segmentLease.GenerationToken)
+	}
 	defer func() { _ = segmentLease.Close() }()
 	sw := httpstream.NewRollingDeadlineWriter(w)
 	http.ServeContent(sw, r, segmentLease.Info.Name(), segmentLease.Info.ModTime(), segmentLease.File)
-	if r.Method == http.MethodGet &&
+	if !proxied && r.Method == http.MethodGet &&
 		sw.CompletedFullResponse(r.Context(), segmentLease.Info.Size()) {
 		if segmentNumber, parseErr := playback.ParseSegmentNumber(name); parseErr == nil {
 			session.ReportSegmentDownloadedForGeneration(segmentNumber, segmentLease.Generation)
 		}
 	}
+}
+
+// handleSegmentDownloaded records completion only after the central API has
+// delivered the full segment to its downstream playback client. The generation
+// returned with the original segment response prevents a delayed acknowledgement
+// from advancing a replacement FFmpeg timeline.
+func (s *Server) handleSegmentDownloaded(w http.ResponseWriter, r *http.Request) {
+	sessionID := chi.URLParam(r, "session_id")
+	name := chi.URLParam(r, "name")
+	segmentNumber, err := playback.ParseSegmentNumber(name)
+	if err != nil {
+		http.Error(w, "invalid segment", http.StatusBadRequest)
+		return
+	}
+	generationToken := r.Header.Get(playback.TranscodeSegmentGenerationHeader)
+	if generationToken == "" {
+		http.Error(w, "invalid segment generation", http.StatusBadRequest)
+		return
+	}
+
+	session, ok := s.acquireSessionTouched(sessionID)
+	if !ok {
+		http.Error(w, "session not found", http.StatusNotFound)
+		return
+	}
+	session.ReportSegmentDownloadedForGenerationToken(segmentNumber, generationToken)
+	w.WriteHeader(http.StatusNoContent)
 }
 
 func (s *Server) handleForceReload(w http.ResponseWriter, r *http.Request) {
